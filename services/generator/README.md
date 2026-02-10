@@ -1,0 +1,609 @@
+# Generator Service
+
+## Overview
+
+The Generator Service is an AI-powered test generation orchestrator that creates test cases and automation scripts using Large Language Models (LLMs). It acts as the intelligence layer between test management and execution, leveraging Ollama to transform requirements into executable tests.
+
+## Core Capabilities
+
+### 1. Test Case Generation (`/generate`)
+Automatically generate multiple Gherkin-based test cases from requirement specifications.
+
+**Use Cases:**
+- Rapid test case creation from requirements
+- Expanding test coverage automatically
+- Generating variations of test scenarios
+
+### 2. Static Automation Generation (`/generate-automation`)
+Generate Playwright automation scripts from test case specifications using AI.
+
+**Use Cases:**
+- Convert manual test cases to automated scripts
+- Accelerate automation development
+- Provide script templates for manual refinement
+
+### 3. Execution-Based Automation (`/generate-automation-from-execution`)
+Execute tests iteratively with LLM-driven browser actions, then convert the execution log into a reusable automation script.
+
+**Use Cases:**
+- Learn automations by doing (exploratory approach)
+- Generate scripts from actual browser interactions
+- Capture complex workflows automatically
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────┐
+│            Generator Service (FastAPI)                  │
+│                                                         │
+│  ┌────────────────┐  ┌──────────────────────────────┐  │
+│  │   /generate    │  │  /generate-automation        │  │
+│  │  (Test Cases)  │  │  (Static Scripts)            │  │
+│  └───────┬────────┘  └──────────┬───────────────────┘  │
+│          │                       │                      │
+│          └───────────┬───────────┘                      │
+│                      ▼                                  │
+│          ┌──────────────────────┐                       │
+│          │  /generate-auto...   │                       │
+│          │  from-execution      │                       │
+│          │  (Execution-based)   │                       │
+│          └──────────┬───────────┘                       │
+└───────────────────┼─────────────────────────────────────┘
+                    │
+         ┌──────────┼──────────┐
+         ▼          ▼          ▼
+    ┌────────┐ ┌─────────┐ ┌──────────┐
+    │ Ollama │ │Playwright│ │Test      │
+    │  LLM   │ │   MCP    │ │Services  │
+    └────────┘ └─────────┘ └──────────┘
+```
+
+## Technology Stack
+
+- **Framework**: FastAPI (Python 3.11+)
+- **AI Integration**: Ollama API
+- **HTTP Client**: httpx (async)
+- **Test Format**: Gherkin (Given/When/Then)
+- **Automation Framework**: Playwright (JavaScript)
+
+## Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OLLAMA_URL` | `http://ollama:11434` | Ollama service endpoint |
+| `OLLAMA_MODEL` | `llama3.1` | LLM model to use |
+| `AUTOMATIONS_SERVICE_URL` | `http://automations:8000` | Automations service URL |
+| `PLAYWRIGHT_MCP_URL` | `http://playwright-mcp-agent:3000` | Playwright MCP endpoint |
+| `REQUIREMENTS_SERVICE_URL` | `http://localhost:8001` | Requirements service URL |
+| `TESTCASES_SERVICE_URL` | `http://localhost:8002` | Test cases service URL |
+
+## Endpoints
+
+### 1. Health Check
+```
+GET /health
+```
+
+**Response:**
+```json
+{
+  "status": "ok",
+  "timestamp": "2025-12-13T10:30:00.000Z"
+}
+```
+
+### 2. Generate Test Cases
+```
+POST /generate
+```
+
+Generate Gherkin test cases from a requirement using AI.
+
+**Request:**
+```json
+{
+  "requirement_id": "req_123",
+  "amount": 3,
+  "mode": "add"
+}
+```
+
+**Parameters:**
+- `requirement_id` (string, required) - ID of the requirement
+- `amount` (int, required) - Number of test cases to generate
+- `mode` (string, optional) - "add" or "replace" existing tests
+
+**Response:**
+```json
+{
+  "generated": [
+    {
+      "id": "tc_456",
+      "title": "User Login (auto #1)",
+      "gherkin": "Feature: User Login\n\n  Scenario: Valid login...",
+      "status": "draft",
+      "requirement_id": "req_123"
+    }
+  ]
+}
+```
+
+### 3. Generate Static Automation
+```
+POST /generate-automation
+```
+
+Generate a Playwright automation script from test specifications.
+
+**Request:**
+```json
+{
+  "test_case_id": "tc_456",
+  "title": "User Login Test",
+  "description": "Verify user can login with valid credentials",
+  "preconditions": "User account exists",
+  "steps": [
+    {
+      "action": "Navigate to login page",
+      "expected_result": "Login page displayed"
+    },
+    {
+      "action": "Enter username 'testuser'",
+      "expected_result": null
+    },
+    {
+      "action": "Click login button",
+      "expected_result": "Dashboard displayed"
+    }
+  ]
+}
+```
+
+**Response:**
+```json
+{
+  "title": "User Login Test",
+  "framework": "playwright",
+  "script_outline": "await page.goto('https://example.com/login');\nawait page.fill('input[name=\"username\"]', 'testuser');\nawait page.click('button#login');",
+  "notes": "Generated by llama3.1 on 2025-12-13T10:30:00.000Z"
+}
+```
+
+### 4. Generate Automation from Execution
+```
+POST /generate-automation-from-execution
+```
+
+Execute the test iteratively with LLM guidance, capture actions, and generate a script.
+
+**Request:**
+```json
+{
+  "test_case_id": "tc_456"
+}
+```
+
+**Response:**
+```json
+{
+  "automation_id": "auto_789",
+  "title": "User Login Test",
+  "framework": "playwright",
+  "script_outline": "await page.goto('http://localhost:5173');\nawait page.click('button.login');\nawait page.fill('input[name=\"username\"]', 'testuser');",
+  "notes": "Generated by execution via MCP on 2025-12-13T10:30:00.000Z",
+  "actions_taken": "LLM Response: navigate(http://localhost:5173)\nAction: navigate(http://localhost:5173) - Navigated successfully\n..."
+}
+```
+
+## How It Works
+
+### Test Case Generation Flow
+
+```
+1. Fetch Requirement
+   ├─ GET /requirements/{id}
+   └─ Extract title, description
+   
+2. Generate with Ollama
+   ├─ Prompt: "Generate Gherkin scenario..."
+   ├─ Model: llama3.1
+   └─ Parse response
+   
+3. Fallback (if LLM fails)
+   └─ Use template-based generation
+   
+4. Store Test Cases
+   ├─ POST /testcases
+   └─ Return generated tests
+```
+
+### Static Automation Generation Flow
+
+```
+1. Parse Test Case Details
+   ├─ Title, description, preconditions
+   └─ Extract test steps
+   
+2. Generate with Ollama
+   ├─ Prompt: "Generate Playwright script..."
+   ├─ Include step-by-step guidance
+   └─ Parse JavaScript code
+   
+3. Clean Response
+   ├─ Remove markdown code blocks
+   └─ Strip explanations
+   
+4. Fallback Generation
+   ├─ Parse steps for keywords (navigate, click, fill)
+   └─ Generate basic script structure
+   
+5. Save to Automations
+   └─ POST /automations
+```
+
+### Execution-Based Generation Flow
+
+```
+1. Fetch Test Case
+   ├─ GET /testcases/{id}
+   └─ Extract metadata (steps, description)
+   
+2. Execute via Playwright MCP
+   ├─ POST /execute-test
+   ├─ LLM decides each action iteratively
+   ├─ Browser performs actions
+   └─ Video recorded automatically
+   
+3. Parse Action Log
+   ├─ Extract: "Action: navigate(url)"
+   ├─ Convert to: "await page.goto('url');"
+   └─ Build script line-by-line
+   
+4. Save Automation
+   ├─ POST /automations
+   └─ Include video filename in metadata
+   
+5. Return Results
+   └─ Script + actions log + automation ID
+```
+
+## Video Recording
+
+### How It Works
+
+**Execution-based generation** automatically records video of the browser session:
+
+1. **Generate Filename**: `{test_case_id}_{timestamp}.webm`
+2. **Pass to MCP**: Included in `/execute-test` request
+3. **MCP Records**: Browser session captured at 1280x720
+4. **Save to Volume**: Written to shared `/videos` volume
+5. **Store Metadata**: Filename saved in automation metadata
+
+**Example metadata:**
+```json
+{
+  "generated_at": "2025-12-13T10:30:00Z",
+  "model": "llama3.1",
+  "video_filename": "tc_456_1702468200.webm"
+}
+```
+
+### Accessing Videos
+
+Videos are stored in the shared volume and accessible via:
+- Automations service: `GET /automations/{id}/video`
+- Direct path: `/videos/{filename}.webm`
+
+## Integration with Ollama
+
+### Model Configuration
+
+**Default Model**: `llama3.1`  
+**Alternative**: Can use any Ollama-compatible model
+
+### Prompt Engineering
+
+#### Test Case Generation Prompt
+
+```
+You are a QA engineer. Generate a concise Gherkin scenario for this requirement.
+Include Given/When/Then steps only.
+
+Requirement: {title}
+Description: {description}
+Scenario index: {idx}
+```
+
+**Example Output:**
+```gherkin
+Feature: User Authentication
+
+  Scenario: Successful login with valid credentials
+    Given the user is on the login page
+    When the user enters valid credentials
+    And clicks the login button
+    Then the user should be redirected to the dashboard
+    And a welcome message is displayed
+```
+
+#### Automation Script Generation Prompt
+
+```
+You are an automation engineer. Generate a complete Playwright script for this test case.
+The script should be executable JavaScript code that can be passed to Playwright's page object.
+Use async/await syntax and include all necessary browser navigation, interactions, and assertions.
+Do NOT include any imports or browser launch code - just the test logic itself.
+
+Test Case Title: {title}
+Description: {description}
+Preconditions: {preconditions}
+
+Test Steps:
+1. Action: {action}
+   Expected: {expected_result}
+...
+
+Generate ONLY the JavaScript code without markdown formatting or explanations.
+```
+
+**Example Output:**
+```javascript
+await page.goto('https://example.com/login');
+await page.fill('input[name="username"]', 'testuser');
+await page.fill('input[name="password"]', 'password123');
+await page.click('button[type="submit"]');
+await page.waitForNavigation();
+const title = await page.title();
+if (title !== 'Dashboard') throw new Error('Login failed');
+```
+
+### LLM Communication
+
+**Request Format:**
+```json
+{
+  "model": "llama3.1",
+  "prompt": "...",
+  "stream": false
+}
+```
+
+**Response Handling:**
+```python
+data = resp.json()
+text = data.get("response") or data.get("output") or ""
+text = text.strip()
+
+# Remove markdown code blocks
+if text.startswith("```"):
+    lines = text.split('\n')[1:]  # Skip first line
+    if lines[-1].strip() == "```":
+        lines = lines[:-1]  # Skip last line
+    text = '\n'.join(lines).strip()
+```
+
+### Fallback Strategy
+
+If Ollama fails or returns empty:
+1. **Test Cases**: Use template-based Gherkin
+2. **Automations**: Parse steps for keywords and generate basic script
+
+**Template Example:**
+```python
+def simple_gherkin(title: str, desc: str, idx: int) -> str:
+    return (
+        f"Feature: {title}\n\n"
+        f"  Scenario: Auto-generated scenario #{idx}\n"
+        f"    Given the system is ready\n"
+        f"    When the user triggers '{title}'\n"
+        f"    Then the expected outcome is achieved\n"
+    )
+```
+
+## Configuration
+
+### Docker Compose
+
+```yaml
+services:
+  generator:
+    build: ./services/generator
+    environment:
+      - OLLAMA_URL=http://ollama:11434
+      - OLLAMA_MODEL=llama3.1
+      - AUTOMATIONS_SERVICE_URL=http://automations:8006
+      - PLAYWRIGHT_MCP_URL=http://playwright-mcp-agent:3000
+      - REQUIREMENTS_SERVICE_URL=http://requirements:8001
+      - TESTCASES_SERVICE_URL=http://testcases:8002
+    ports:
+      - "8003:8000"
+    depends_on:
+      - ollama
+      - playwright-mcp
+      - automations
+```
+
+### CORS Configuration
+
+**Allowed Origins:**
+- `http://localhost:5173` (Frontend dev server)
+- `http://localhost:3000`
+
+**Allowed Methods:** All  
+**Credentials:** Enabled
+
+## Integration Examples
+
+### From Frontend (React)
+
+```javascript
+// Generate test cases
+const response = await axios.post('http://localhost:8003/generate', {
+  requirement_id: requirementId,
+  amount: 5,
+  mode: 'add'
+});
+
+console.log(`Generated ${response.data.generated.length} test cases`);
+```
+
+```javascript
+// Generate automation from execution
+const response = await axios.post(
+  'http://localhost:8003/generate-automation-from-execution',
+  { test_case_id: testCaseId }
+);
+
+console.log(`Automation ID: ${response.data.automation_id}`);
+console.log(`Script:\n${response.data.script_outline}`);
+```
+
+### From Python Service
+
+```python
+import httpx
+
+async with httpx.AsyncClient() as client:
+    # Generate static automation
+    response = await client.post(
+        "http://generator:8003/generate-automation",
+        json={
+            "test_case_id": "tc_123",
+            "title": "Login Test",
+            "steps": [
+                {
+                    "action": "Navigate to /login",
+                    "expected_result": "Login page shown"
+                }
+            ]
+        }
+    )
+    automation = response.json()
+    print(f"Generated script:\n{automation['script_outline']}")
+```
+
+### From cURL
+
+```bash
+# Generate test cases
+curl -X POST http://localhost:8003/generate \
+  -H "Content-Type: application/json" \
+  -d '{
+    "requirement_id": "req_123",
+    "amount": 3,
+    "mode": "add"
+  }'
+
+# Generate automation from execution
+curl -X POST http://localhost:8003/generate-automation-from-execution \
+  -H "Content-Type: application/json" \
+  -d '{"test_case_id": "tc_456"}'
+```
+
+## Best Practices
+
+### Test Case Generation
+
+1. **Start Small**: Generate 1-3 test cases initially to review quality
+2. **Use "add" Mode**: Preserve existing tests unless replacing intentionally
+3. **Review Generated Tests**: AI may need guidance via requirement descriptions
+
+### Automation Generation
+
+1. **Provide Detailed Steps**: More detail = better script quality
+2. **Include Expected Results**: Helps LLM add assertions
+3. **Use Execution-Based**: For complex workflows, let LLM explore the UI
+
+### Performance
+
+1. **Timeouts**: Test case generation: 20s, Automation: 120s, Execution: 300s
+2. **Batch Generation**: Multiple test cases in one request is more efficient
+3. **Model Selection**: Larger models = better quality, slower response
+
+## Troubleshooting
+
+### Empty or Poor Quality Test Cases
+
+**Symptoms:**
+- Generated Gherkin is generic
+- Steps don't match requirement
+
+**Solutions:**
+1. Improve requirement descriptions
+2. Verify Ollama model loaded: `docker exec ollama ollama list`
+3. Check logs for Ollama errors
+4. Try different model (e.g., `gpt-oss:20b`)
+
+### Automation Script Doesn't Execute
+
+**Symptoms:**
+- Syntax errors in generated script
+- Script is too generic ("TODO" comments)
+
+**Solutions:**
+1. Provide more detailed test steps
+2. Use execution-based generation for learning approach
+3. Manually refine generated script
+4. Check Playwright MCP logs for execution errors
+
+### Execution-Based Generation Stuck
+
+**Symptoms:**
+- Request times out (>300s)
+- No automation created
+
+**Solutions:**
+1. Check Playwright MCP service status
+2. Verify Ollama responsive: `curl http://localhost:11434/api/generate`
+3. Check test case has valid steps in metadata
+4. Review MCP logs for LLM iteration issues
+
+### Video Not Generated
+
+**Symptoms:**
+- Automation created but no video in metadata
+- Video file doesn't exist
+
+**Solutions:**
+1. Check Playwright MCP service is recording
+2. Verify shared volume mounted: `docker volume ls`
+3. Check MCP logs for "Video saved to..." message
+4. Ensure `/videos` volume shared between services
+
+## Performance Metrics
+
+| Operation | Typical Time | Depends On |
+|-----------|--------------|------------|
+| Generate test case | 2-5s per test | Ollama model, complexity |
+| Generate automation | 5-15s | Script complexity, model |
+| Execution-based gen | 30-180s | UI complexity, LLM iterations |
+
+## Error Handling
+
+All endpoints return standard error responses:
+
+```json
+{
+  "detail": "Error message"
+}
+```
+
+**Common Errors:**
+
+| Status | Error | Cause |
+|--------|-------|-------|
+| 404 | "Requirement not found" | Invalid requirement_id |
+| 404 | "Test case not found" | Invalid test_case_id |
+| 500 | "Failed to save automation" | Automations service error |
+| 503 | Ollama timeout | Model not loaded or slow |
+
+## Future Enhancements
+
+- [ ] Support multiple LLM providers (OpenAI, Anthropic)
+- [ ] Test case refinement endpoint (regenerate specific tests)
+- [ ] Automation validation (syntax check before saving)
+- [ ] Parallel test case generation
+- [ ] Custom prompt templates
+- [ ] Test data generation from schemas
+- [ ] Integration test suite generation
+- [ ] Performance test script generation

@@ -1,0 +1,296 @@
+services:
+  mongo:
+    image: mongo:7
+    container_name: aitp-mongo
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    networks:
+      - app-network
+
+  requirements:
+    build:
+      context: .
+      dockerfile: services/requirements/Dockerfile
+    environment:
+      - MONGO_URL=mongodb://mongo:27017
+      - DB_NAME=aitp
+    ports:
+      - "8001:8000"
+    depends_on:
+      - mongo
+    networks:
+      - app-network
+
+  testcases:
+    build:
+      context: .
+      dockerfile: services/testcases/Dockerfile
+    environment:
+      - MONGO_URL=mongodb://mongo:27017
+      - DB_NAME=aitp
+    ports:
+      - "8002:8000"
+    depends_on:
+      - mongo
+    networks:
+      - app-network
+
+  generator:
+    build:
+      context: .
+      dockerfile: services/generator/Dockerfile
+    environment:
+      - MONGO_URL=mongodb://mongo:27017
+      - DB_NAME=aitp
+      - REQUIREMENTS_SERVICE_URL=http://requirements:8000
+      - TESTCASES_SERVICE_URL=http://testcases:8000
+      - RELEASES_SERVICE_URL=http://releases:8000
+      - OLLAMA_URL=http://ollama:11434
+      - OLLAMA_MODEL=gpt-oss:20b
+      - OLLAMA_MCP_AGENT_URL=http://ollama-mcp-agent:3000
+      - AUTOMATIONS_SERVICE_URL=http://automations:8000
+      - PLAYWRIGHT_MCP_URL=http://playwright-mcp-agent:3000
+    ports:
+      - "8003:8000"
+    depends_on:
+      - mongo
+      - requirements
+      - testcases
+      - ollama
+    networks:
+      - app-network
+
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    command: ["serve"]
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - OLLAMA_VULKAN=0
+    runtime: nvidia
+    restart: unless-stopped
+    networks:
+      - app-network
+
+  ollama-init:
+    image: ollama/ollama:latest
+    depends_on:
+      - ollama
+    entrypoint: ["/bin/sh", "-c"]
+    command: "sleep 2 && ollama pull gpt-oss:20b"
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+
+  releases:
+    build:
+      context: .
+      dockerfile: services/releases/Dockerfile
+    environment:
+      - MONGO_URL=mongodb://mongo:27017
+      - DB_NAME=aitp
+    ports:
+      - "8004:8000"
+    depends_on:
+      - mongo
+    networks:
+      - app-network
+
+  executions:
+    build:
+      context: .
+      dockerfile: services/executions/Dockerfile
+    environment:
+      - MONGO_URL=mongodb://mongo:27017
+      - DB_NAME=aitp
+    ports:
+      - "8005:8000"
+    depends_on:
+      - mongo
+    networks:
+      - app-network
+
+  toabrkia:
+    build:
+      context: .
+      dockerfile: services/toabrkia/Dockerfile
+    environment:
+      - MONGO_URL=mongodb://mongo:27017
+      - DB_NAME=aitp
+    ports:
+      - "8008:8000"
+    depends_on:
+      - mongo
+    networks:
+      - app-network
+
+  testcase-migration:
+    build:
+      context: .
+      dockerfile: services/testcase-migration/Dockerfile
+    environment:
+      - TESTCASES_SERVICE_URL=http://testcases:8000
+      - GENERATOR_SERVICE_URL=http://generator:8000
+      - AUTOMATIONS_SERVICE_URL=http://automations:8000
+      - OLLAMA_URL=http://ollama:11434
+      - OLLAMA_MODEL=gpt-oss:20b
+      - MIGRATION_REQUIREMENT_ID=unlinked
+    ports:
+      - "8009:8000"
+    depends_on:
+      - testcases
+      - generator
+      - automations
+      - ollama
+    networks:
+      - app-network
+
+  automations:
+    build:
+      context: .
+      dockerfile: services/automations/Dockerfile
+    environment:
+      - MONGO_URL=mongodb://mongo:27017
+      - DB_NAME=aitp
+      - PLAYWRIGHT_MCP_URL=http://playwright-mcp-agent:3000
+      - EXECUTIONS_SERVICE_URL=http://executions:8000
+    ports:
+      - "8006:8000"
+    volumes:
+      - automation_videos:/videos
+    depends_on:
+      - mongo
+      - playwright-mcp-agent
+      - executions
+    networks:
+      - app-network
+
+  playwright-mcp-core:
+    image: mcr.microsoft.com/playwright/mcp:latest
+    container_name: playwright-mcp-core
+    user: "0:0"
+    entrypoint: ["node"]
+    command:
+      - cli.js
+      - --headless
+      - --browser
+      - chromium
+      - --no-sandbox
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8931"
+      - --output-dir
+      - /videos
+      - --save-video=1280x720
+      - --allowed-hosts
+      - "*"
+    ports:
+      - "8931:8931"
+    volumes:
+      - automation_videos:/videos
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  playwright-mcp-agent:
+    build:
+      context: .
+      dockerfile: services/playwright-mcp-agent/Dockerfile
+    container_name: playwright-mcp-agent
+    ports:
+      - "3000:3000"
+    volumes:
+      - automation_videos:/videos
+    environment:
+      - VIDEO_PATH=/videos
+      - PORT=3000
+      - PLAYWRIGHT_MCP_OFFICIAL_URL=http://playwright-mcp-core:8931/mcp
+    networks:
+      - app-network
+    restart: unless-stopped
+    depends_on:
+      - playwright-mcp-core
+
+  ollama-mcp-agent:
+    build:
+      context: .
+      dockerfile: services/ollama-mcp-agent/Dockerfile
+    container_name: ollama-mcp-agent
+    ports:
+      - "3002:3000"
+    volumes:
+      - automation_videos:/videos
+    environment:
+      - PORT=3000
+      - OLLAMA_URL=http://ollama:11434
+      - OLLAMA_MODEL=gpt-oss:20b
+      - PLAYWRIGHT_MCP_OFFICIAL_URL=http://playwright-mcp-core:8931/mcp
+      - VIDEO_PATH=/videos
+      - MAX_ITERATIONS=12
+      - MAX_TOOL_CALLS_PER_ITERATION=8
+    networks:
+      - app-network
+    restart: unless-stopped
+    depends_on:
+      - ollama
+      - playwright-mcp-core
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./frontend/src:/app/src
+      - ./frontend/index.html:/app/index.html
+      - ./frontend/vite.config.js:/app/vite.config.js
+      - ./frontend/jsconfig.json:/app/jsconfig.json
+    depends_on:
+      - requirements
+      - testcases
+      - releases
+      - executions
+      - toabrkia
+      - generator
+    environment:
+      - VITE_API_BASE_URL=http://localhost:8001
+    networks:
+      - app-network
+
+  git:
+    build:
+      context: .
+      dockerfile: services/git/Dockerfile
+    environment:
+      - WORKSPACE_DIR=/workspace
+      - SSH_KEYS_DIR=/ssh-keys
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
+      - GITLAB_TOKEN=${GITLAB_TOKEN:-}
+      - AZURE_DEVOPS_TOKEN=${AZURE_DEVOPS_TOKEN:-}
+      - AZURE_DEVOPS_ORG=${AZURE_DEVOPS_ORG:-}
+    ports:
+      - "8007:8000"
+    volumes:
+      - git_workspace:/workspace
+      - git_ssh_keys:/ssh-keys
+    networks:
+      - app-network
+
+volumes:
+  mongo_data:
+  ollama_data:
+  automation_videos:
+  git_workspace:
+  git_ssh_keys:
+
+networks:
+  app-network:
+    driver: bridge

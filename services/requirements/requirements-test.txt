@@ -1,0 +1,15 @@
+# Test dependencies for requirements service
+
+# Testing framework
+pytest==8.3.4
+pytest-asyncio==0.24.0
+pytest-cov==6.0.0
+
+# HTTP client for testing
+httpx==0.28.1
+
+# Runtime dependencies (from main requirements.txt)
+fastapi==0.115.5
+uvicorn==0.34.0
+motor==3.6.0
+pydantic==2.10.3

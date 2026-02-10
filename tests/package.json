@@ -1,0 +1,28 @@
+{
+  "name": "ai-testing-e2e-tests",
+  "version": "1.0.0",
+  "description": "End-to-end tests for AI Testing Platform",
+  "type": "module",
+  "scripts": {
+    "test": "playwright test",
+    "test:ui": "playwright test --ui",
+    "test:headed": "playwright test --headed",
+    "test:debug": "playwright test --debug",
+    "test:frontend": "playwright test frontend/",
+    "test:report": "playwright show-report",
+    "codegen": "playwright codegen http://localhost:5173"
+  },
+  "keywords": [
+    "e2e",
+    "testing",
+    "playwright"
+  ],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "@playwright/test": "^1.48.0"
+  },
+  "dependencies": {
+    "js-yaml": "^4.1.1"
+  }
+}

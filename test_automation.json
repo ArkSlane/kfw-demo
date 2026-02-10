@@ -1,0 +1,19 @@
+{
+  "title": "Test Login Functionality",
+  "description": "Test user login with valid credentials",
+  "preconditions": "User account exists in database",
+  "steps": [
+    {
+      "action": "Navigate to login page",
+      "expected_result": "Login page is displayed"
+    },
+    {
+      "action": "Enter username and password",
+      "expected_result": "Credentials are accepted"
+    },
+    {
+      "action": "Click login button",
+      "expected_result": "User is redirected to dashboard"
+    }
+  ]
+}
