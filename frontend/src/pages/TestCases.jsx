@@ -338,20 +338,28 @@ export default function TestCases() {
     if (!automationDraftTestCase) return;
     setIsExecutingAutomation(true);
     try {
-      const resp = await generatorAPI.executeScript({ test_case_id: automationDraftTestCase.id, script });
+      // Use automationChat with execute=true so the model/agent runs the script and returns metadata
+      const res = await generatorAPI.automationChat({
+        test_case_id: automationDraftTestCase.id,
+        message: 'Please execute the provided script',
+        history: [],
+        context: { script_outline: script },
+        execute: true,
+      });
 
-      if (resp.video_path) {
-        const busted = `${resp.video_path}?t=${Date.now()}`;
+      if (res.video_path || res.video_filename) {
+        const vf = res.video_path ? res.video_path : `/videos/${res.video_filename}`;
+        const busted = `${vf}?t=${Date.now()}`;
         setAutomationVideoUrl(busted);
         toast.success('Execution finished — fresh recording available');
-      } else if (resp.exec_error) {
-        toast.error(`Execution failed: ${resp.exec_error}`);
+      } else if (res.exec_error) {
+        toast.error(`Execution failed: ${res.exec_error}`);
       } else {
         toast.info('Execution completed');
       }
 
-      if (resp.actions_taken) {
-        setAutomationDraft((prev) => ({ ...(prev || {}), actions_taken: resp.actions_taken }));
+      if (res.actions_taken) {
+        setAutomationDraft((prev) => ({ ...(prev || {}), actions_taken: res.actions_taken }));
       }
     } catch (e) {
       console.error('Execute script error:', e);

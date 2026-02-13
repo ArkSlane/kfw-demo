@@ -2,7 +2,7 @@ import axios from "axios";
 
 // jsconfig.json enables checkJs; cast import.meta to any for Vite env access.
 const viteEnv = /** @type {any} */ (import.meta).env;
-const GIT_URL = viteEnv?.VITE_GIT_URL || "http://localhost:8007";
+const GIT_URL = "/svc/8007";
 
 const gitRepoConnectionsAPI = {
   list: async () => {

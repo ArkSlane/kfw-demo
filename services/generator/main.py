@@ -16,6 +16,16 @@ from git_integration import push_test_to_git, trigger_test_execution
 
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1")
+AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT") or os.getenv("AZURE_OPENAI_ENDPOINT_URL")
+# Accept either AZURE_OPENAI_KEY or the older AZURE_OPENAI_API_KEY name if provided
+AZURE_OPENAI_KEY = os.getenv("AZURE_OPENAI_KEY") or os.getenv("AZURE_OPENAI_API_KEY")
+# Accept multiple deployment/env var names for compatibility
+AZURE_OPENAI_DEPLOYMENT = (
+    os.getenv("AZURE_OPENAI_DEPLOYMENT")
+    or os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
+    or os.getenv("AZURE_OPENAI_MODEL")
+)
+AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2023-10-01-preview")
 AUTOMATIONS_URL = os.getenv("AUTOMATIONS_SERVICE_URL", "http://automations:8000")
 PLAYWRIGHT_MCP_URL = os.getenv("PLAYWRIGHT_MCP_URL", "http://playwright-mcp-agent:3000")
 OLLAMA_MCP_AGENT_URL = os.getenv("OLLAMA_MCP_AGENT_URL", "http://ollama-mcp-agent:3000")
@@ -68,6 +78,8 @@ class AutomationChatRequest(BaseModel):
     message: str
     history: list[dict] = Field(default_factory=list)
     context: dict = Field(default_factory=dict)
+    # When true, attempt to execute the requested actions (record a video) via the Ollama MCP agent
+    execute: bool = False
 
 
 class AutomationChatResponse(BaseModel):
@@ -136,8 +148,8 @@ app = FastAPI(
 
 async def _execute_script_with_retries(client: httpx.AsyncClient, script: str, video_filename: str | None = None, *,
     record_video: bool = True,
-    max_retries: int = 3,
-    base_timeout: int = 15,
+    max_retries: int = 2,
+    base_timeout: int = 90,
     max_video_bytes: int = 50_000_000,
 ) -> dict:
     """Execute a Playwright script via Playwright-MCP with retries and per-request timeouts.
@@ -145,8 +157,10 @@ async def _execute_script_with_retries(client: httpx.AsyncClient, script: str, v
     Returns the parsed JSON response from the MCP execute endpoint.
     """
     url = f"{PLAYWRIGHT_MCP_URL}/execute"
+    # Rewrite localhost URLs to Docker-internal URLs before execution
+    exec_script = _rewrite_localhost_in_text(script)
     payload = {
-        "script": script,
+        "script": exec_script,
         "record_video": bool(record_video),
     }
     if video_filename:
@@ -156,7 +170,7 @@ async def _execute_script_with_retries(client: httpx.AsyncClient, script: str, v
 
     last_exc: Exception | None = None
     for attempt in range(1, max_retries + 1):
-        timeout = base_timeout * attempt
+        timeout = base_timeout + (attempt - 1) * 30  # 90s, 120s
         try:
             resp = await client.post(url, json=payload, timeout=timeout)
             resp.raise_for_status()
@@ -164,10 +178,76 @@ async def _execute_script_with_retries(client: httpx.AsyncClient, script: str, v
         except Exception as e:
             last_exc = e
             if attempt < max_retries:
-                await asyncio.sleep(min(5, attempt))
+                # Wait for the browser session from the timed-out request to finish
+                await asyncio.sleep(10)
                 continue
             # final attempt failed -> raise
             raise last_exc
+
+
+async def call_chat(client: httpx.AsyncClient, prompt: str, *, model: str | None = None, stream: bool = False, fmt: str | None = None, functions: list | None = None, timeout: int = 90) -> dict:
+    """Call either Azure OpenAI Chat or local Ollama /api/generate and return a dict with a text response.
+
+    Returns a dict similar to Ollama's /api/generate response: keys like 'response' or 'output'.
+    """
+    # Azure path
+    if AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_KEY and AZURE_OPENAI_DEPLOYMENT:
+        try:
+            url = f"{AZURE_OPENAI_ENDPOINT.rstrip('/')}/openai/deployments/{AZURE_OPENAI_DEPLOYMENT}/chat/completions?api-version={AZURE_OPENAI_API_VERSION}"
+            payload: dict = {"messages": [{"role": "user", "content": prompt}], "temperature": 0}
+            # Request JSON output format when fmt="json" is specified
+            if fmt == "json":
+                payload["response_format"] = {"type": "json_object"}
+            # Use the modern tools API (functions is deprecated in newer models like GPT-5.x)
+            if functions:
+                payload["tools"] = [{"type": "function", "function": f} for f in functions]
+                payload["tool_choice"] = "auto"
+            resp = await client.post(url, json=payload, headers={"api-key": AZURE_OPENAI_KEY}, timeout=timeout)
+            resp.raise_for_status()
+            data = resp.json()
+            choice = (data.get("choices") or [{}])[0]
+            message = choice.get("message") or {}
+            content = message.get("content") or ""
+            out = {"response": content, "output": content, "raw": data}
+
+            # Extract tool_calls from the modern tools API response
+            tool_calls_raw = message.get("tool_calls") or []
+            if tool_calls_raw:
+                mapped = []
+                for tc in tool_calls_raw:
+                    func = tc.get("function") or {}
+                    args = func.get("arguments")
+                    try:
+                        if isinstance(args, str):
+                            args = json.loads(args)
+                    except Exception:
+                        pass
+                    mapped.append({"function": {"name": func.get("name"), "arguments": args}})
+                out["message"] = {"tool_calls": mapped}
+
+            # Also handle legacy function_call response (older API versions)
+            fc = message.get("function_call")
+            if fc and "message" not in out:
+                args = fc.get("arguments")
+                try:
+                    if isinstance(args, str):
+                        args = json.loads(args)
+                except Exception:
+                    pass
+                out["message"] = {"tool_calls": [{"function": {"name": fc.get("name"), "arguments": args}}]}
+            return out
+        except Exception as azure_err:
+            # Azure failed (DNS/unreachable etc.) — fall back to Ollama path below
+            print(f"call_chat: Azure OpenAI failed ({type(azure_err).__name__}: {azure_err}), falling back to Ollama")
+
+    # Fallback: Ollama HTTP API
+    resp = await client.post(
+        f"{OLLAMA_URL}/api/generate",
+        json={"model": model or OLLAMA_MODEL, "prompt": prompt, "stream": stream, "format": fmt},
+        timeout=timeout,
+    )
+    resp.raise_for_status()
+    return resp.json()
 
 
 # Setup standardized error handlers
@@ -372,6 +452,61 @@ def _rewrite_goto_lines(code: str) -> str:
     return re.sub(r"page\.goto\(\s*['\"](?P<url>[^'\"]+)['\"]\s*\)", _replace, code)
 
 
+async def _execute_tool_calls_via_playwright_agent(client: httpx.AsyncClient, tool_calls: list) -> dict:
+    """Convert a list of tool_calls (from Azure function_call mapping) into a Playwright script and execute via the playwright-mcp-agent `/execute` endpoint.
+
+    Returns the JSON response from the agent.
+    """
+    if not tool_calls:
+        return {"success": False, "error": "no tool_calls"}
+
+    # Build a simple script from the tool calls. This is heuristic and covers common browser_* tools.
+    lines: list[str] = []
+    for tc in tool_calls:
+        func = tc.get("function") if isinstance(tc, dict) else tc
+        if not func:
+            continue
+        name = func.get("name")
+        args = func.get("arguments") or {}
+        if name in ("browser_navigate", "navigate", "goto"):
+            url = args.get("url") or args.get("target") or args.get("value")
+            if url:
+                lines.append(f"await page.goto({_js_single_quoted(rewrite_localhost_url(url))});")
+        elif name in ("browser_click", "click"):
+            sel = args.get("selector") or args.get("element") or args.get("target") or args.get("text")
+            if sel:
+                lines.append(f"await page.click({_js_single_quoted(sel)});")
+        elif name in ("browser_fill", "fill", "type"):
+            sel = args.get("selector") or args.get("element") or args.get("target")
+            val = args.get("value") or args.get("text") or args.get("keys") or ""
+            if sel:
+                lines.append(f"await page.fill({_js_single_quoted(sel)}, {_js_single_quoted(val)});")
+        elif name in ("browser_wait_for", "wait_for", "wait"):
+            t = int(args.get("time") or args.get("ms") or 1)
+            # assume seconds
+            lines.append(f"await page.waitForTimeout({int(t) * 1000});")
+        elif name in ("browser_run_code",):
+            code = args.get("code") or ""
+            # try to unwrap wrapper if present
+            code = _unwrap_playwright_script_to_page_only(code)
+            lines.append(code)
+        else:
+            # Unknown tool: try to represent as comment
+            lines.append(f"// Unsupported tool call: {name} {json.dumps(args)}")
+
+    if not lines:
+        return {"success": False, "error": "no script generated from tool_calls"}
+
+    script = "\n".join(lines)
+    payload = {"script": script, "record_video": False}
+    try:
+        resp = await client.post(f"{PLAYWRIGHT_MCP_URL.rstrip('/')}/execute", json=payload, timeout=120)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
 def build_script_from_agent_transcript(transcript) -> str:
     """Extract runnable Playwright code from the Ollama-MCP agent transcript."""
     if not transcript or not isinstance(transcript, list):
@@ -417,10 +552,13 @@ def rewrite_localhost_url(url: str) -> str:
     return raw
 
 
+_LOCALHOST_URL_RE = re.compile(r"https?://(?:localhost|127\.0\.0\.1|0\.0\.0\.0)(?::\d{2,5})?")
+
 def _rewrite_localhost_in_text(text: str) -> str:
     if not text:
         return text
-    return _BARE_LOCALHOST_RE.sub(lambda m: rewrite_localhost_url(m.group(0)), text)
+    # Match full URLs (including scheme) to avoid double http:// after rewriting
+    return _LOCALHOST_URL_RE.sub(lambda m: rewrite_localhost_url(m.group(0)), text)
 
 
 async def _fetch_json_optional(client: httpx.AsyncClient, url: str) -> dict | None:
@@ -704,19 +842,7 @@ async def generate_structured_testcase_with_ollama(
             )
 
         try:
-            resp = await client.post(
-                f"{OLLAMA_URL}/api/generate",
-                json={
-                    "model": OLLAMA_MODEL,
-                    "prompt": prompt,
-                    "stream": False,
-                    # Best-effort: Ollama supports JSON mode. If unsupported, it is ignored.
-                    "format": "json",
-                },
-                timeout=90,
-            )
-            resp.raise_for_status()
-            data = resp.json()
+            data = await call_chat(client, prompt, model=OLLAMA_MODEL, stream=False, fmt="json", timeout=90)
             text = (data.get("response") or data.get("output") or "").strip()
             text = _strip_markdown_code_fences(text)
             json_text = _extract_first_json_object(text) or text
@@ -829,18 +955,7 @@ async def generate_test_suite_with_ollama(
             )
 
         try:
-            resp = await client.post(
-                f"{OLLAMA_URL}/api/generate",
-                json={
-                    "model": OLLAMA_MODEL,
-                    "prompt": prompt,
-                    "stream": False,
-                    "format": "json",
-                },
-                timeout=120,
-            )
-            resp.raise_for_status()
-            data = resp.json()
+            data = await call_chat(client, prompt, model=OLLAMA_MODEL, stream=False, fmt="json", timeout=120)
             text = (data.get("response") or data.get("output") or "").strip()
             text = _strip_markdown_code_fences(text)
             json_text = _extract_first_json_object(text) or text
@@ -896,19 +1011,8 @@ async def generate_with_ollama(client: httpx.AsyncClient, requirement_title: str
         f"Scenario index: {idx}\n"
     )
     try:
-        resp = await client.post(
-            f"{OLLAMA_URL}/api/generate",
-            json={
-                "model": OLLAMA_MODEL,
-                "prompt": prompt,
-                "stream": False,
-            },
-            timeout=60,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        text = data.get("response") or data.get("output") or ""
-        text = text.strip()
+        data = await call_chat(client, prompt, model=OLLAMA_MODEL, stream=False, timeout=60)
+        text = (data.get("response") or data.get("output") or "").strip()
         return text or None
     except Exception:
         return None
@@ -934,31 +1038,22 @@ async def generate_automation_with_ollama(client: httpx.AsyncClient, test_case_t
         "const title = await page.title();\n"
         "if (title !== 'Expected Title') throw new Error('Title mismatch');\n"
     )
+
     try:
-        resp = await client.post(
-            f"{OLLAMA_URL}/api/generate",
-            json={
-                "model": OLLAMA_MODEL,
-                "prompt": prompt,
-                "stream": False,
-            },
-            timeout=120,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        text = data.get("response") or data.get("output") or ""
-        text = text.strip()
-        
-        # Remove markdown code blocks if present
+        data = await call_chat(client, prompt, model=OLLAMA_MODEL, stream=False, timeout=120)
+        text = (data.get("response") or data.get("output") or "").strip()
+        text = _strip_markdown_code_fences(text)
+        text = _unwrap_playwright_script_to_page_only(text)
+
+        # Remove surrounding code fences if present
         if text.startswith("```"):
             lines = text.split('\n')
-            # Remove first line (```javascript or similar)
-            lines = lines[1:]
-            # Remove last line if it's just ```
-            if lines and lines[-1].strip() == "```":
+            if lines and lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].strip().startswith("```"):
                 lines = lines[:-1]
             text = '\n'.join(lines).strip()
-        
+
         return text or None
     except Exception:
         return None
@@ -1018,6 +1113,88 @@ def _unwrap_playwright_script_to_page_only(script: str) -> str:
     return text.strip()
 
 
+def _build_script_from_tool_calls(tool_calls_executed: list) -> str:
+    """Build a clean, readable Playwright script from the structured tool_calls_executed list.
+
+    Each entry has: { iteration, name, arguments: { ... } }
+    """
+    if not tool_calls_executed:
+        return ""
+
+    lines: list[str] = []
+    for tc in tool_calls_executed:
+        name = tc.get("name", "")
+        args = tc.get("arguments") or {}
+
+        if name == "browser_navigate":
+            url = args.get("url", "")
+            # Show localhost for display, rewriting happens at execution time
+            lines.append(f"await page.goto('{url}');")
+            lines.append("await page.waitForLoadState('networkidle');")
+
+        elif name == "browser_click":
+            element = args.get("element", "")
+            ref = args.get("ref", "")
+            if element:
+                # Use text-based selector for readability
+                lines.append(f"await page.getByText('{_escape_js_string(element)}').click();")
+            elif ref:
+                lines.append(f"// click ref={ref}")
+
+        elif name in ("browser_type", "browser_fill"):
+            element = args.get("element", "")
+            text = args.get("text", args.get("value", ""))
+            submit = args.get("submit", False)
+            if element:
+                lines.append(f"await page.getByText('{_escape_js_string(element)}').fill('{_escape_js_string(text)}');")
+            else:
+                lines.append(f"await page.locator('input,textarea').first().fill('{_escape_js_string(text)}');")
+            if submit:
+                lines.append("await page.keyboard.press('Enter');")
+
+        elif name == "browser_select_option":
+            element = args.get("element", "")
+            values = args.get("values", [])
+            val_str = json.dumps(values) if isinstance(values, list) else f"['{values}']"
+            lines.append(f"await page.getByText('{_escape_js_string(element)}').selectOption({val_str});")
+
+        elif name == "browser_hover":
+            element = args.get("element", "")
+            lines.append(f"await page.getByText('{_escape_js_string(element)}').hover();")
+
+        elif name == "browser_press_key":
+            key = args.get("key", "")
+            lines.append(f"await page.keyboard.press('{_escape_js_string(key)}');")
+
+        elif name == "browser_wait_for":
+            t = int(args.get("time", 1))
+            lines.append(f"await page.waitForTimeout({t * 1000});")
+
+        elif name == "browser_run_code":
+            code = args.get("code", "")
+            code = _unwrap_playwright_script_to_page_only(code)
+            if code.strip():
+                lines.append(code.strip())
+
+        elif name == "browser_snapshot":
+            # Snapshot is an inspection tool, not an action — skip in output script
+            continue
+
+        elif name == "browser_close":
+            # Close is handled by the runtime, skip
+            continue
+
+        else:
+            lines.append(f"// {name}({json.dumps(args)})")
+
+    return "\n".join(lines)
+
+
+def _escape_js_string(s: str) -> str:
+    """Escape a string for use inside JS single quotes."""
+    return (s or "").replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n")
+
+
 async def generate_playwright_script_step_by_step_with_ollama(
     client: httpx.AsyncClient,
     test_case_title: str,
@@ -1026,14 +1203,20 @@ async def generate_playwright_script_step_by_step_with_ollama(
     steps,
     base_url_hint: str,
     context_text: str = "",
-) -> tuple[str | None, str]:
-    """Generate a Playwright script by iterating steps.
+    record_video: bool = False,
+    video_filename: str | None = None,
+) -> tuple[str | None, str, dict]:
+    """Generate a Playwright script by having the MCP agent interactively execute the steps.
 
-    Returns: (final_script_or_none, generation_log)
+    The agent can inspect the actual DOM via browser_snapshot, so it uses real
+    selectors instead of guessing. We then build a clean Playwright script from
+    the tool calls it executed.
+
+    Returns: (final_script_or_none, generation_log, exec_info_dict)
     """
 
     if not steps:
-        return None, "No steps provided"
+        return None, "No steps provided", {}
 
     if isinstance(steps, str):
         steps_list = [steps]
@@ -1042,85 +1225,153 @@ async def generate_playwright_script_step_by_step_with_ollama(
     else:
         steps_list = [steps]
 
-    current_script = ""
-    log_lines: list[str] = []
+    steps_text = format_steps_for_mcp(steps_list)
+    if not steps_text.strip():
+        return None, "No actionable steps found", {}
 
     context_text = (context_text or "").strip()
     if len(context_text) > 4000:
-        context_text = context_text[:4000].rstrip() + "\n\n[Context truncated]"
+        context_text = context_text[:4000].rstrip() + "\n[Context truncated]"
 
+    # Build prompt for the MCP agent — it will browse the app and execute steps
+    prompt_parts = [
+        f"Test Case: {test_case_title}",
+        f"Description: {description or 'N/A'}",
+        f"Preconditions: {preconditions or 'N/A'}",
+    ]
+    if context_text:
+        prompt_parts.append(f"\nContext:\n{context_text}")
+    # The MCP agent runs inside Docker, so use the internal frontend URL
+    internal_url = INTERNAL_FRONTEND_BASE_URL
+    prompt_parts.append(
+        f"\nThe application is running at {internal_url}."
+        "\nNavigate there first, then execute each step."
+        "\nUse browser_snapshot() before each interaction to see the actual page elements."
+    )
+
+    user_prompt = "\n".join(prompt_parts)
+
+    log_lines: list[str] = []
+    exec_info: dict = {}
+    try:
+        run_payload = {
+            "prompt": user_prompt,
+            "test_description": description or test_case_title,
+            "steps": steps_text,
+            "record_video": bool(record_video),
+            "max_iterations": 15,
+        }
+        if record_video and video_filename:
+            run_payload["video_path"] = video_filename
+        run_resp = await client.post(
+            f"{OLLAMA_MCP_AGENT_URL}/run",
+            json=run_payload,
+            timeout=300,
+        )
+        run_resp.raise_for_status()
+        run_data = run_resp.json()
+
+        tool_calls_executed = run_data.get("tool_calls_executed") or []
+        completed = run_data.get("completed_steps")
+        total = run_data.get("total_steps")
+        success = run_data.get("success", False)
+        video_saved = run_data.get("video_saved", False)
+        actions_taken = run_data.get("actions_taken", "")
+
+        exec_info = {
+            "success": success,
+            "video_saved": video_saved,
+            "video_path": run_data.get("video_path"),
+            "actions_taken": actions_taken,
+            "completed_steps": completed,
+            "total_steps": total,
+        }
+
+        # Build a clean Playwright script from the actual tool calls
+        script = _build_script_from_tool_calls(tool_calls_executed)
+
+        if completed and total:
+            log_lines.append(f"MCP agent completed {completed}/{total} steps")
+        log_lines.append(f"Tool calls: {len(tool_calls_executed)}, success={success}")
+
+        if not script.strip():
+            log_lines.append("No actionable tool calls captured")
+            return None, "\n".join(log_lines), exec_info
+
+        # Rewrite Docker-internal URLs back to localhost for display
+        script = script.replace("http://frontend:5173", "http://localhost:5173")
+
+        return script.strip(), "\n".join(log_lines), exec_info
+
+    except Exception as e:
+        log_lines.append(f"MCP agent error: {e}")
+        # Fallback: generate script via LLM without DOM inspection
+        log_lines.append("Falling back to LLM-only generation...")
+        try:
+            script = await _generate_script_via_llm_only(
+                client, test_case_title, description, preconditions,
+                steps_list, base_url_hint, context_text,
+            )
+            if script:
+                log_lines.append("LLM fallback: OK")
+                return script, "\n".join(log_lines), exec_info
+        except Exception as fallback_err:
+            log_lines.append(f"LLM fallback error: {fallback_err}")
+
+        return None, "\n".join(log_lines), exec_info
+
+
+async def _generate_script_via_llm_only(
+    client: httpx.AsyncClient,
+    test_case_title: str,
+    description: str,
+    preconditions: str,
+    steps_list: list,
+    base_url_hint: str,
+    context_text: str,
+) -> str | None:
+    """Fallback: generate a Playwright script via a single LLM call (no DOM inspection)."""
+    steps_block_lines = []
     for idx, step in enumerate(steps_list, start=1):
         action, expected = _format_step_for_llm(step, idx)
         if not action:
             continue
+        line = f"  {idx}. {action}"
+        if expected:
+            line += f" (Expected: {expected})"
+        steps_block_lines.append(line)
 
-        context_block = ""
-        if context_text:
-            context_block = (
-                "Context (may include app details, selectors, auth notes):\n"
-                f"{context_text}\n\n"
-            )
+    if not steps_block_lines:
+        return None
 
-        prompt = "".join(
-            [
-                "You are an expert Playwright automation engineer. ",
-                "We are building ONE Playwright script incrementally, one manual step at a time.\n\n",
-                "Output ONLY JavaScript code (no markdown, no code fences, no explanations).\n",
-                "IMPORTANT execution detail: your returned code will be inserted inside `async (page) => { ... }` and executed via Playwright MCP.\n",
-                "Only `page` is guaranteed to exist. Do NOT reference `context` or `browser`.\n",
-                "Do NOT wrap your code in any function/IIFE; return only the statements that belong inside the function body.\n\n",
-                f"Execution environment note: navigation base URL inside Docker is {base_url_hint}. ",
-                "If a step mentions localhost/127.0.0.1/0.0.0.0, treat it as that base URL.\n\n",
-                f"Test Case: {test_case_title}\n",
-                f"Description: {description or 'N/A'}\n",
-                f"Preconditions: {preconditions or 'N/A'}\n\n",
-                context_block,
-                "Current script so far (you MUST keep and extend it):\n",
-                f"{current_script}\n\n",
-                f"Now implement Step {idx}: {action}\n",
-                f"Expected result: {expected or 'N/A'}\n\n",
-                "Return the FULL updated script (including prior lines) as plain JavaScript code.",
-            ]
-        )
+    steps_block = "\n".join(steps_block_lines)
+    context_block = f"Context:\n{context_text}\n\n" if context_text else ""
 
-        try:
-            resp = await client.post(
-                f"{OLLAMA_URL}/api/generate",
-                json={
-                    "model": OLLAMA_MODEL,
-                    "prompt": prompt,
-                    "stream": False,
-                },
-                timeout=120,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            text = (data.get("response") or data.get("output") or "").strip()
-            text = _strip_markdown_code_fences(text)
-            if not text:
-                log_lines.append(f"Step {idx}: empty model output")
-                continue
+    prompt = "".join([
+        "You are an expert Playwright automation engineer.\n",
+        "Generate a Playwright script implementing ALL steps below.\n",
+        "Output ONLY JavaScript code (no markdown, no fences, no explanations).\n",
+        "Code runs inside `async (page) => { ... }`. Only `page` exists.\n\n",
+        "Use simple selectors: page.getByText('...'), page.getByRole('button', {name:'...'}), page.locator('textarea').first().\n",
+        "NEVER guess complex selectors. Keep it simple.\n",
+        "Add await page.waitForLoadState('networkidle') after navigation.\n",
+        "Add await page.waitForTimeout(1000) after interactions that open dialogs.\n\n",
+        f"App URL: {base_url_hint}\n\n",
+        f"Test Case: {test_case_title}\n",
+        f"Description: {description or 'N/A'}\n",
+        f"Preconditions: {preconditions or 'N/A'}\n\n",
+        context_block,
+        f"Steps:\n{steps_block}\n\n",
+        "Return the complete script as plain JavaScript.",
+    ])
 
-            text = _unwrap_playwright_script_to_page_only(text)
-
-            # Rewrite any localhost-y URLs in the generated code.
-            try:
-                text = _URL_RE.sub(lambda m: rewrite_localhost_url(m.group(1)), text)
-            except Exception:
-                pass
-            try:
-                text = _rewrite_localhost_in_text(text)
-            except Exception:
-                pass
-
-            current_script = text.strip()
-            log_lines.append(f"Step {idx}: OK")
-        except Exception as e:
-            log_lines.append(f"Step {idx}: error: {e}")
-
-    final_script = (current_script or "").strip()
-    if not final_script:
-        return None, "\n".join(log_lines) or "No script generated"
+    data = await call_chat(client, prompt, model=OLLAMA_MODEL, stream=False, timeout=120)
+    text = (data.get("response") or data.get("output") or "").strip()
+    text = _strip_markdown_code_fences(text)
+    if not text:
+        return None
+    text = _unwrap_playwright_script_to_page_only(text)
+    return text.strip() or None
     return final_script, "\n".join(log_lines)
 
 @app.get("/health")
@@ -1293,40 +1544,38 @@ async def generate_automation_from_execution(payload: ExecutionGenerateRequest):
         steps = metadata.get("steps", [])
 
         context_text, context_meta = await _build_llm_execution_context(client, test_case)
-        script_outline, generation_log = await generate_playwright_script_step_by_step_with_ollama(
+
+        video_filename = f"{payload.test_case_id}_{int(datetime.now(timezone.utc).timestamp())}.webm"
+
+        # MCP agent generates the script AND executes it (with video recording)
+        script_outline, generation_log, exec_info = await generate_playwright_script_step_by_step_with_ollama(
             client,
             test_case_title=title,
             description=description,
             preconditions=preconditions,
             steps=steps,
-            base_url_hint=INTERNAL_FRONTEND_BASE_URL,
+            base_url_hint="http://localhost:5173",
             context_text=context_text,
+            record_video=True,
+            video_filename=video_filename,
         )
         if not script_outline:
             script_outline = build_fallback_script_from_steps(steps)
 
-        video_filename = f"{payload.test_case_id}_{int(datetime.now(timezone.utc).timestamp())}.webm"
-        actions_taken = ""
-        exec_success = False
-        exec_error = None
-        video_saved = False
+        exec_success = exec_info.get("success", False)
+        actions_taken = exec_info.get("actions_taken", "")
+        exec_error = exec_info.get("error")
+        video_saved = exec_info.get("video_saved", False)
 
-        try:
-            exec_data = await _execute_script_with_retries(client, script_outline, video_filename, record_video=True)
-            exec_success = bool(exec_data.get("success"))
-            actions_taken = exec_data.get("actions_taken") or exec_data.get("message") or ""
-            exec_error = exec_data.get("error")
-            video_saved = bool(exec_data.get("video_saved"))
-        except Exception as e:
-            exec_error = str(e)
+        effective_model = f"azure:{AZURE_OPENAI_DEPLOYMENT}" if (AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_KEY and AZURE_OPENAI_DEPLOYMENT) else OLLAMA_MODEL
 
         if exec_success:
             automation_status = "not_started"
-            generation_note = f"Generated step-by-step via LLM and executed on {now_iso()}."
+            generation_note = f"Generated step-by-step via {effective_model} and executed on {now_iso()}."
             notes_with_code = f"{generation_note}\n\nCode:\n{script_outline}" if script_outline else generation_note
             generation_metadata = {
                 "generated_at": now_iso(),
-                "model": OLLAMA_MODEL,
+                "model": effective_model,
                 "preconditions": preconditions,
                 "video_filename": video_filename,
                 "generation_mode": "step_by_step",
@@ -1403,40 +1652,36 @@ async def generate_automation_draft_from_execution(payload: ExecutionGenerateReq
 
         context_text, context_meta = await _build_llm_execution_context(client, test_case)
 
-        script_outline, generation_log = await generate_playwright_script_step_by_step_with_ollama(
+        video_filename = f"{payload.test_case_id}_{int(datetime.now(timezone.utc).timestamp())}.webm"
+        exec_mode = "mcp_driven"
+
+        # MCP agent generates the script AND executes it (with video recording)
+        script_outline, generation_log, exec_info = await generate_playwright_script_step_by_step_with_ollama(
             client,
             test_case_title=title,
             description=description,
             preconditions=preconditions,
             steps=steps,
-            base_url_hint=INTERNAL_FRONTEND_BASE_URL,
+            base_url_hint="http://localhost:5173",
             context_text=context_text,
+            record_video=True,
+            video_filename=video_filename,
         )
         if not script_outline:
             script_outline = build_fallback_script_from_steps(steps)
 
-        video_filename = f"{payload.test_case_id}_{int(datetime.now(timezone.utc).timestamp())}.webm"
-        exec_mode = "step_by_step"
-        actions_taken = ""
-        transcript_out: str | None = None
-        exec_error = None
-        exec_success = False
-        video_saved = False
+        exec_success = exec_info.get("success", False)
+        actions_taken = exec_info.get("actions_taken", "")
+        transcript_out = actions_taken
+        exec_error = exec_info.get("error")
+        video_saved = exec_info.get("video_saved", False)
 
-        try:
-            exec_data = await _execute_script_with_retries(client, script_outline, video_filename, record_video=True)
-            exec_success = bool(exec_data.get("success"))
-            actions_taken = exec_data.get("actions_taken") or exec_data.get("message") or ""
-            transcript_out = actions_taken
-            exec_error = exec_data.get("error")
-            video_saved = bool(exec_data.get("video_saved"))
-        except Exception as e:
-            exec_error = str(e)
+        effective_model = f"azure:{AZURE_OPENAI_DEPLOYMENT}" if (AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_KEY and AZURE_OPENAI_DEPLOYMENT) else OLLAMA_MODEL
+        notes = f"Generated via MCP agent ({effective_model}) on {now_iso()}."
 
-        notes = f"Generated step-by-step via LLM and executed on {now_iso()}."
         generation_metadata = {
             "generated_at": now_iso(),
-            "model": OLLAMA_MODEL,
+            "model": effective_model,
             "preconditions": preconditions,
             "video_filename": video_filename,
             "generation_mode": exec_mode,
@@ -1466,6 +1711,27 @@ async def generate_automation_draft_from_execution(payload: ExecutionGenerateReq
         )
 
 
+_MCP_RUN_INTENT_RE = re.compile(
+    r"\b("
+    r"do\s+(the\s+)?(full\s+)?steps"
+    r"|do\s+all\s+steps"
+    r"|perform\s+(the\s+)?steps"
+    r"|execute\s+(the\s+)?(full\s+)?steps"
+    r"|run\s+(the\s+)?(full\s+)?steps"
+    r"|do\s+it"
+    r"|please\s+(run|execute|do)"
+    r"|generate\s+(the\s+)?script"
+    r"|create\s+(the\s+)?script"
+    r"|run\s+the\s+automation"
+    r"|execute\s+the\s+automation"
+    r"|automate\s+(this|it|all|the\s+steps)"
+    r"|run\b"
+    r"|execute\b"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
 @app.post("/automation-chat", response_model=AutomationChatResponse)
 async def automation_chat(payload: AutomationChatRequest):
     """Chat endpoint to help review/adjust a generated automation draft before saving."""
@@ -1487,6 +1753,97 @@ async def automation_chat(payload: AutomationChatRequest):
     exec_error = (context.get("exec_error") or "").strip()
     video_filename = (context.get("video_filename") or "").strip()
 
+    # Fetch the test case steps from the testcases service so the LLM has full context
+    test_case_steps_text = ""
+    test_case_title = ""
+    test_case_description = ""
+    tc_steps_raw: list = []
+    async with httpx.AsyncClient(timeout=10) as tc_client:
+        try:
+            tc_resp = await tc_client.get(f"{TC_URL}/testcases/{payload.test_case_id}")
+            if tc_resp.status_code == 200:
+                tc_data = tc_resp.json()
+                test_case_title = tc_data.get("title", "")
+                tc_meta = tc_data.get("metadata", {})
+                test_case_description = tc_meta.get("description", "")
+                tc_steps_raw = tc_meta.get("steps", [])
+                test_case_steps_text = format_steps_for_mcp(tc_steps_raw)
+        except Exception:
+            pass  # Non-critical; we'll still answer with what context we have
+
+    # ── Early check: does the user want us to *execute* the steps via MCP? ──
+    user_wants_mcp_run = (
+        bool(payload.execute)
+        or (isinstance(payload.message, str) and _MCP_RUN_INTENT_RE.search(payload.message))
+    )
+
+    if user_wants_mcp_run and test_case_steps_text.strip():
+        # Route directly to the MCP agent so it can inspect the real DOM
+        try:
+            video_filename_local = f"{payload.test_case_id}_{int(datetime.now(timezone.utc).timestamp())}.webm"
+            async with httpx.AsyncClient(timeout=300) as run_client:
+                internal_url = INTERNAL_FRONTEND_BASE_URL
+                run_prompt = (
+                    f"Test Case: {test_case_title}\n"
+                    f"Description: {test_case_description or 'N/A'}\n"
+                    f"The application is running at {internal_url}.\n"
+                    "Navigate there first, then execute each step.\n"
+                    "Use browser_snapshot() before each interaction to see the actual page elements."
+                )
+                run_payload = {
+                    "prompt": run_prompt,
+                    "test_description": test_case_description or test_case_title,
+                    "steps": test_case_steps_text,
+                    "record_video": True,
+                    "video_path": video_filename_local,
+                    "max_iterations": 15,
+                }
+                run_resp = await run_client.post(
+                    f"{OLLAMA_MCP_AGENT_URL}/run",
+                    json=run_payload,
+                    timeout=300,
+                )
+                run_resp.raise_for_status()
+                run_data = run_resp.json()
+
+            tool_calls_executed = run_data.get("tool_calls_executed") or []
+            success = run_data.get("success", False)
+            video_saved = run_data.get("video_saved", False)
+            completed = run_data.get("completed_steps")
+            total = run_data.get("total_steps")
+
+            # Build a clean Playwright script from the tool calls
+            script = _build_script_from_tool_calls(tool_calls_executed)
+            # Rewrite Docker-internal URLs back to localhost for display
+            if script:
+                script = script.replace("http://frontend:5173", "http://localhost:5173")
+
+            reply_parts = []
+            if completed and total:
+                reply_parts.append(f"Executed {completed}/{total} steps via MCP agent with DOM inspection.")
+            else:
+                reply_parts.append(f"Ran MCP agent ({len(tool_calls_executed)} tool calls).")
+            if not success:
+                err = run_data.get("error", "")
+                if err:
+                    reply_parts.append(f"Error: {err}")
+
+            out = AutomationChatResponse(
+                reply=" ".join(reply_parts),
+                suggested_script=script.strip() if script and script.strip() else None,
+                exec_success=bool(success),
+                exec_error=run_data.get("error") if not success else None,
+            )
+            if video_saved:
+                out.video_filename = video_filename_local
+                out.video_path = f"/videos/{video_filename_local}"
+            return out
+
+        except Exception as e:
+            print(f"automation_chat: MCP /run failed: {e}")
+            # Fall through to normal LLM chat
+            pass
+
     history_lines: list[str] = []
     for item in history[-10:]:
         if not isinstance(item, dict):
@@ -1500,8 +1857,15 @@ async def automation_chat(payload: AutomationChatRequest):
         "You are an automation engineer helping a user review and adjust a Playwright automation draft. "
         "Return a SINGLE JSON object (no extra text). Use double quotes for all JSON keys/strings. "
         f"Schema: {schema_hint}. "
-        "Rules: reply is required. suggested_script is null or a full updated Playwright script body (no imports). "
-        "If you include suggested_script, encode newlines as \\n inside the JSON string.\n\n"
+        "Rules: reply is required. suggested_script is null or a full updated Playwright script body (no imports, page-only statements using the 'page' variable). "
+        "If you include suggested_script, it MUST implement ALL the test case steps below, not just the first one. "
+        "If you include suggested_script, encode newlines as \\n inside the JSON string.\n"
+        "IMPORTANT: You do NOT have direct access to the application DOM or Playwright MCP tools in this chat. "
+        "If the user asks you to run steps, generate a script based on the test case steps. Use simple selectors like page.getByText(), page.getByRole(), page.locator(). "
+        "Do NOT ask the user for HTML or selectors — just generate the best script you can.\n\n"
+        f"Test case title: {test_case_title or 'N/A'}\n"
+        f"Test case description: {test_case_description or 'N/A'}\n"
+        f"Test case steps (MUST all be automated):\n{test_case_steps_text or 'N/A'}\n\n"
         f"Test case id: {payload.test_case_id}\n"
         f"Execution error (if any): {exec_error or 'N/A'}\n"
         f"Video filename (if any): {video_filename or 'N/A'}\n"
@@ -1519,31 +1883,85 @@ async def automation_chat(payload: AutomationChatRequest):
         last_text: str | None = None
         for _attempt in range(1, 4):
             try:
-                resp = await client.post(
-                    f"{OLLAMA_URL}/api/generate",
-                    json={
-                        "model": OLLAMA_MODEL,
-                        "prompt": prompt if not last_error else (prompt + f"\nFix your JSON. Error: {last_error}"),
-                        "stream": False,
-                    },
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                text = (data.get("response") or data.get("output") or "").strip()
+                data = await call_chat(client, prompt if not last_error else (prompt + f"\nFix your JSON. Error: {last_error}"), model=OLLAMA_MODEL, stream=False, fmt="json", timeout=60)
+                # Support both plain text responses and function_call/tool_call-style responses
+                # (Azure may return a function_call with arguments instead of a content string).
+                text = ""
+                # If the model returned a message object (mapped to tool_calls), prefer its arguments
+                message_obj = data.get("message") if isinstance(data, dict) else None
+                if isinstance(message_obj, dict):
+                    try:
+                        tool_calls = message_obj.get("tool_calls") or []
+                        if tool_calls:
+                            # Take the first tool call's function.arguments if present
+                            first = tool_calls[0]
+                            func = first.get("function") or {}
+                            args = func.get("arguments")
+                            if isinstance(args, (dict, list)):
+                                # If arguments already include expected keys, build a JSON reply
+                                if isinstance(args, dict) and ("suggested_script" in args or "script" in args or "reply" in args):
+                                    j = {"reply": args.get("reply", ""), "suggested_script": args.get("suggested_script") or args.get("script")}
+                                    text = json.dumps(j, ensure_ascii=False)
+                                else:
+                                    # Fallback: stringify the arguments so downstream parsing can try
+                                    text = json.dumps(args, ensure_ascii=False)
+                            elif isinstance(args, str) and args.strip():
+                                text = args.strip()
+                    except Exception:
+                        text = ""
+
+                if not text:
+                    text = (data.get("response") or data.get("output") or "").strip()
                 last_text = text
                 if not text:
                     raise ValueError("empty LLM response")
                 text = _strip_markdown_code_fences(text)
                 json_text = _extract_first_json_object(text) or text
                 parsed = json.loads(json_text)
-                out = AutomationChatResponse.model_validate(parsed)
 
+                # Handle double-encoded JSON: if `reply` is itself a JSON string containing `reply`, unwrap it
+                if isinstance(parsed.get("reply"), str):
+                    inner = parsed["reply"].strip()
+                    if inner.startswith("{") and inner.endswith("}"):
+                        try:
+                            inner_parsed = json.loads(inner)
+                            if isinstance(inner_parsed, dict) and "reply" in inner_parsed:
+                                parsed = inner_parsed
+                        except (json.JSONDecodeError, ValueError):
+                            pass
+
+                out = AutomationChatResponse.model_validate(parsed)
                 # If the model suggested an updated script, execute it and return video metadata
                 suggested = (out.suggested_script or "").strip()
-                if suggested:
+                # If model did not return `suggested_script` but the free-text reply contains a script,
+                # try to sanitize and execute that code as well.
+                model_text_script = None
+                if not suggested and isinstance(last_text, str) and last_text.strip():
+                    txt = _strip_markdown_code_fences(last_text)
+                    # Heuristics: script-like content contains page.* or await/page or require('playwright') or chromium.launch
+                    if re.search(r"\bawait\s+page\.|page\.goto\(|require\(|chromium\.launch|browser\.newContext|newContext\(|page\.click\(", txt):
+                        # Remove top-level imports and node/browser launch lines
+                        lines = []
+                        for line in txt.splitlines():
+                            s = line.strip()
+                            if re.search(r"^(const|let|var)\s+\{?\s*chromium|require\(|^import\s+|chromium\.launch|browser\.newContext|browser\.newPage|const\s+browser|manual_check\(|module\.exports", s):
+                                continue
+                            # remove immediate function wrappers and final invocation lines
+                            if re.search(r"\b(async\s+function|\(async\s*\(|\)\s*\(page|manual_check\(\)\s*;)", s):
+                                continue
+                            lines.append(line)
+                        candidate = "\n".join(lines).strip()
+                        candidate = _unwrap_playwright_script_to_page_only(candidate)
+                        # Ensure we have some page.* statements
+                        if re.search(r"\bpage\.(goto|click|fill|waitFor|waitForSelector|title)\b|await\s+page\.", candidate):
+                            model_text_script = candidate
+                if suggested or model_text_script:
+                    to_run = suggested if suggested else model_text_script
                     video_filename_local = f"{payload.test_case_id}_{int(datetime.now(timezone.utc).timestamp())}.webm"
                     try:
-                        exec_data = await _execute_script_with_retries(client, suggested, video_filename_local, record_video=True)
+                        # Ensure the script is normalized to page-only statements
+                        to_run_norm = _unwrap_playwright_script_to_page_only(_strip_markdown_code_fences(to_run))
+                        exec_data = await _execute_script_with_retries(client, to_run_norm, video_filename_local, record_video=True)
                         out.exec_success = bool(exec_data.get("success"))
                         out.exec_error = exec_data.get("error")
                         video_saved = bool(exec_data.get("video_saved"))
@@ -1557,8 +1975,16 @@ async def automation_chat(payload: AutomationChatRequest):
                 return out
             except (json.JSONDecodeError, ValidationError) as e:
                 last_error = str(e)
+                try:
+                    print("automation_chat: JSON/Validation error:", last_error, "raw_data:", repr(data)[:1000])
+                except Exception:
+                    print("automation_chat: JSON/Validation error:", last_error)
             except Exception as e:
                 last_error = str(e)
+                try:
+                    print("automation_chat: general error:", last_error, "raw_data:", repr(data)[:1000])
+                except Exception:
+                    print("automation_chat: general error:", last_error)
 
         # Last-resort: return whatever the model said (if anything) as plain text.
         if last_text and last_text.strip():

@@ -2,7 +2,7 @@ import axios from 'axios';
 
 // jsconfig.json enables checkJs; cast import.meta to any for Vite env access.
 const viteEnv = /** @type {any} */ (import.meta).env;
-const TESTCASE_MIGRATION_URL = viteEnv?.VITE_TESTCASE_MIGRATION_URL || 'http://localhost:8009';
+const TESTCASE_MIGRATION_URL = '/svc/8009';
 
 const testcaseMigrationAPI = {
   health: async () => {

@@ -11,6 +11,11 @@ const PORT = Number(process.env.PORT || 3000);
 
 const OLLAMA_URL = (process.env.OLLAMA_URL || 'http://ollama:11434').replace(/\/$/, '');
 const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'gpt-oss:20b';
+const AZURE_OPENAI_ENDPOINT = process.env.AZURE_OPENAI_ENDPOINT || process.env.AZURE_OPENAI_ENDPOINT_URL || null;
+// Accept either AZURE_OPENAI_KEY or AZURE_OPENAI_API_KEY for compatibility
+const AZURE_OPENAI_KEY = process.env.AZURE_OPENAI_KEY || process.env.AZURE_OPENAI_API_KEY || null;
+const AZURE_OPENAI_DEPLOYMENT = process.env.AZURE_OPENAI_DEPLOYMENT || process.env.AZURE_OPENAI_DEPLOYMENT_NAME || process.env.AZURE_OPENAI_MODEL || null;
+const AZURE_OPENAI_API_VERSION = process.env.AZURE_OPENAI_API_VERSION || '2023-10-01-preview';
 const OFFICIAL_MCP_URL = process.env.PLAYWRIGHT_MCP_OFFICIAL_URL || 'http://playwright-mcp-core:8931/mcp';
 const VIDEO_DIR = process.env.VIDEO_PATH || '/videos';
 
@@ -26,16 +31,36 @@ app.use(express.json({ limit: '2mb' }));
 
 function buildSystemPrompt({ recordVideo, videoPath } = {}) {
   const base = [
-    'You are an automation agent that can control a browser using MCP tools.',
-    'You MUST accomplish the user task by calling tools. Prefer tool calls over guessing.',
-    'IMPORTANT: Follow the provided steps STRICTLY. Do NOT perform extra actions not requested by the steps.',
-    'You MUST complete ALL numbered steps provided by the user. Do not stop early.',
-    'Track progress explicitly. Only mark a step complete after you have actually executed it via tool calls and confirmed the result via snapshots/tool output.',
-    'Use browser_navigate to open pages. Use browser_snapshot to find elements and refs.',
-    'When clicking, prefer providing both element (human description) and ref when available.',
-    'After navigation or clicks, use browser_wait_for(time=1) briefly if needed.',
-    'Avoid saving files unless explicitly asked (e.g., do not pass snapshot filenames unless required).',
-    'When all steps are completed, STOP calling tools and reply with a short summary that begins with: DONE (completed_steps=X total_steps=Y)'
+    'You are an automation agent that controls a browser using MCP tools.',
+    'You MUST accomplish the user task by calling tools. NEVER guess — always verify first.',
+    '',
+    '=== AVAILABLE MCP TOOLS ===',
+    '• browser_navigate({ url }) — navigate to a URL',
+    '• browser_snapshot() — capture the current page accessibility tree (shows all visible elements with ref= attributes). ALWAYS call this before interacting with elements.',
+    '• browser_click({ element, ref }) — click an element. Use "element" for a human description and "ref" from the snapshot.',
+    '• browser_type({ element, ref, text, submit? }) — type text into an input/textarea. Set submit=true to press Enter after.',
+    '• browser_select_option({ element, ref, values }) — select dropdown option(s)',
+    '• browser_hover({ element, ref }) — hover over an element',
+    '• browser_wait_for({ time }) — wait N seconds',
+    '• browser_press_key({ key }) — press a keyboard key (e.g., "Enter", "Tab", "Escape")',
+    '• browser_close() — close the browser (call at end if recording video)',
+    '• browser_run_code({ code }) — run arbitrary Playwright JS code as async (page) => { ... }',
+    '',
+    '=== WORKFLOW ===',
+    '1. Navigate to the page',
+    '2. Call browser_snapshot() to see the current state',
+    '3. Find the element you need by its text/role in the snapshot, note its ref=',
+    '4. Interact with it (click, type, etc.) using both element description and ref',
+    '5. Call browser_snapshot() again to verify the result and see the updated state',
+    '6. Repeat for each step',
+    '',
+    '=== RULES ===',
+    '- ALWAYS snapshot before clicking or typing — never guess element refs',
+    '- Follow the provided steps STRICTLY. Do NOT perform extra actions.',
+    '- Complete ALL numbered steps. Do not stop early.',
+    '- After navigation or interactions that change the page, snapshot again to see the new state.',
+    '- Interpret steps by their INTENT. If a step says "fill in details", find the relevant input field in the snapshot and type into it.',
+    '- When all steps are completed, STOP calling tools and reply with: DONE (completed_steps=X total_steps=Y)'
   ];
 
   if (recordVideo) {
@@ -289,6 +314,71 @@ async function callMcpTool(client, name, args) {
 }
 
 async function callOllamaChat({ messages, tools }) {
+  // If Azure is configured, use Azure OpenAI Chat Completions API instead
+  if (AZURE_OPENAI_ENDPOINT && AZURE_OPENAI_KEY && AZURE_OPENAI_DEPLOYMENT) {
+    const url = `${AZURE_OPENAI_ENDPOINT.replace(/\/$/, '')}/openai/deployments/${AZURE_OPENAI_DEPLOYMENT}/chat/completions?api-version=${AZURE_OPENAI_API_VERSION}`;
+    const payload = { messages, temperature: 0 };
+    if (Array.isArray(tools) && tools.length) {
+      // Use modern tools API (functions is deprecated in newer models like GPT-5.x)
+      payload.tools = tools.map((t) => {
+        if (t && t.function) return { type: 'function', function: t.function };
+        if (t && t.type === 'function') return t;
+        return undefined;
+      }).filter(Boolean);
+      payload.tool_choice = 'auto';
+    }
+
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'api-key': AZURE_OPENAI_KEY },
+      body: JSON.stringify(payload)
+    });
+
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => '');
+      throw new Error(`Azure OpenAI chat failed: HTTP ${resp.status} ${resp.statusText} ${text}`);
+    }
+
+    const data = await resp.json();
+    // Debug: log truncated Azure response to help diagnose missing function_call
+    try {
+      console.log('AZURE_CHAT_RESPONSE:', JSON.stringify(data).slice(0, 2000));
+    } catch (e) {}
+    const choice = (data?.choices && data.choices[0]) || {};
+    const message = choice.message || {};
+    const content = (message.content && typeof message.content === 'string') ? message.content : '';
+
+    const out = { message: { content }, tool_calls: [] };
+
+    // Handle modern tool_calls response
+    if (Array.isArray(message.tool_calls) && message.tool_calls.length) {
+      out.message.tool_calls = message.tool_calls.map((tc, idx) => {
+        const func = tc.function || {};
+        let args = func.arguments;
+        try { if (typeof args === 'string') args = JSON.parse(args); } catch (e) {}
+        return {
+          id: tc.id || `call_${Date.now()}_${idx}`,
+          type: 'function',
+          function: { name: func.name, arguments: args }
+        };
+      });
+    }
+    // Also handle legacy function_call response
+    else if (message.function_call) {
+      const fc = message.function_call;
+      let args = fc.arguments;
+      try {
+        if (typeof args === 'string') args = JSON.parse(args);
+      } catch (e) {
+        // keep original
+      }
+      out.message.tool_calls = [ { id: `call_${Date.now()}_0`, type: 'function', function: { name: fc.name, arguments: args } } ];
+    }
+
+    return out;
+  }
+
+  // Fallback: call local Ollama API
   const payload = {
     model: OLLAMA_MODEL,
     messages,
@@ -314,19 +404,16 @@ async function callOllamaChat({ messages, tools }) {
 }
 
 function toToolResponseMessage(toolCall, toolName, toolResultText) {
-  const msg = {
+  // Azure requires tool_call_id on every tool response message
+  const id = (toolCall && typeof toolCall === 'object')
+    ? (toolCall.id || toolCall.tool_call_id || toolCall?.function?.id || `call_${Date.now()}_0`)
+    : `call_${Date.now()}_0`;
+
+  return {
     role: 'tool',
-    content: toolResultText,
-    name: toolName
+    content: typeof toolResultText === 'string' ? toolResultText : JSON.stringify(toolResultText || ''),
+    tool_call_id: id
   };
-
-  // Some tool-call formats include an id; include it if present.
-  if (toolCall && typeof toolCall === 'object') {
-    const id = toolCall.id || toolCall.tool_call_id || toolCall?.function?.id;
-    if (id) msg.tool_call_id = id;
-  }
-
-  return msg;
 }
 
 const RunRequestSchema = z
@@ -406,6 +493,11 @@ app.post('/run', async (req, res) => {
 
   try {
     const result = await withMcpClient(async (client) => {
+      // Close any stale browser session from a previous run to prevent "browser already in use" errors
+      try { await callMcpTool(client, 'browser_close', {}); } catch { /* no session to close — OK */ }
+      // Give the browser process a moment to fully shut down
+      await new Promise(r => setTimeout(r, 1500));
+
       const mcpTools = await listMcpTools(client);
       const ollamaTools = mcpTools.map(toOpenAiTool).filter(Boolean);
 
@@ -426,10 +518,23 @@ app.post('/run', async (req, res) => {
         transcript.push({ iteration, role: 'assistant', content: assistantContent, tool_calls: toolCalls });
 
         // Always append the assistant message to the conversation so Ollama can continue coherently.
+        // Azure requires tool_calls to have id, type, and function.arguments as string
+        const sanitizedToolCalls = toolCalls.map((tc, idx) => {
+          const fn = tc?.function || {};
+          const args = fn.arguments;
+          return {
+            id: tc.id || `call_${Date.now()}_${idx}`,
+            type: tc.type || 'function',
+            function: {
+              name: fn.name || '',
+              arguments: typeof args === 'string' ? args : JSON.stringify(args || {})
+            }
+          };
+        });
         messages.push({
           role: 'assistant',
-          content: assistantContent,
-          ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {})
+          content: assistantContent || null,
+          ...(sanitizedToolCalls.length > 0 ? { tool_calls: sanitizedToolCalls } : {})
         });
 
         if (toolCalls.length === 0) {
@@ -472,14 +577,17 @@ app.post('/run', async (req, res) => {
         // Execute tool calls via MCP.
         const cappedToolCalls = toolCalls.slice(0, DEFAULT_MAX_TOOL_CALLS_PER_ITERATION);
 
-        for (const tc of cappedToolCalls) {
+        for (let tcIdx = 0; tcIdx < cappedToolCalls.length; tcIdx++) {
+          const tc = cappedToolCalls[tcIdx];
           const fn = tc?.function;
           const toolName = fn?.name;
           const args = fn?.arguments && typeof fn.arguments === 'object' ? fn.arguments : {};
+          // Use the sanitized id (matches what we pushed into messages for the assistant turn)
+          const tcId = tc.id || sanitizedToolCalls[tcIdx]?.id || `call_${Date.now()}_${tcIdx}`;
 
           if (!toolName || typeof toolName !== 'string') {
             const errText = 'Invalid tool call from model (missing function.name).';
-            messages.push({ role: 'tool', content: errText, name: 'invalid_tool_call' });
+            messages.push({ role: 'tool', content: errText, tool_call_id: tcId });
             transcript.push({ iteration, role: 'tool', name: 'invalid_tool_call', content: errText });
             continue;
           }
@@ -494,7 +602,7 @@ app.post('/run', async (req, res) => {
             toolResultText = `Tool execution failed for ${toolName}: ${e?.message || String(e)}`;
           }
 
-          const toolMsg = toToolResponseMessage(tc, toolName, toolResultText);
+          const toolMsg = toToolResponseMessage({ ...tc, id: tcId }, toolName, toolResultText);
           messages.push(toolMsg);
           transcript.push({ iteration, role: 'tool', name: toolName, content: toolResultText });
         }

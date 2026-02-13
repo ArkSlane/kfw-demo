@@ -2,7 +2,7 @@ import axios from 'axios';
 
 // jsconfig.json enables checkJs; cast import.meta to any for Vite env access.
 const viteEnv = /** @type {any} */ (import.meta).env;
-const GENERATOR_URL = viteEnv?.VITE_GENERATOR_URL || 'http://localhost:8003';
+const GENERATOR_URL = '/svc/8003';
 
 const generatorAPI = {
   generateAutomation: async (testCaseData) => {
@@ -30,15 +30,16 @@ const generatorAPI = {
     }
   },
 
-  automationChat: async ({ test_case_id, message, history = [], context = {} }) => {
+  automationChat: async ({ test_case_id, message, history = [], context = {}, execute = false }) => {
     try {
       const response = await axios.post(`${GENERATOR_URL}/automation-chat`, {
         test_case_id,
         message,
         history,
         context,
+        execute,
       });
-      return response.data; // { reply, suggested_script }
+      return response.data; // { reply, suggested_script, exec_success, video_path }
     } catch (error) {
       console.error('Generator API error:', error.response?.data || error.message);
       throw error;

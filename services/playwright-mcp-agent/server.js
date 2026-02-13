@@ -17,9 +17,9 @@ const OFFICIAL_MCP_URL = process.env.PLAYWRIGHT_MCP_OFFICIAL_URL || 'http://play
 const VIDEO_WIDTH = Number(process.env.VIDEO_WIDTH || 1280);
 const VIDEO_HEIGHT = Number(process.env.VIDEO_HEIGHT || 720);
 
-const VIDEO_MIN_BYTES = Number(process.env.VIDEO_MIN_BYTES || 50 * 1024);
-const VIDEO_STABLE_WAIT_MS = Number(process.env.VIDEO_STABLE_WAIT_MS || 800);
-const VIDEO_FIND_TIMEOUT_MS = Number(process.env.VIDEO_FIND_TIMEOUT_MS || 10_000);
+const VIDEO_MIN_BYTES = Number(process.env.VIDEO_MIN_BYTES || 10 * 1024);
+const VIDEO_STABLE_WAIT_MS = Number(process.env.VIDEO_STABLE_WAIT_MS || 1200);
+const VIDEO_FIND_TIMEOUT_MS = Number(process.env.VIDEO_FIND_TIMEOUT_MS || 20_000);
 
 function textFromToolResult(result) {
   if (!result || !Array.isArray(result.content)) return '';
@@ -378,6 +378,11 @@ app.post('/execute', async (req, res) => {
     const fnCode = `async (page) => {\n  try { await page.setViewportSize({ width: ${VIDEO_WIDTH}, height: ${VIDEO_HEIGHT} }); } catch (e) {}\n${script}\n}`;
 
     await withMcpClient(async (client) => {
+    // Close any stale browser session from a previous run to prevent "browser already in use" errors
+    try { await callTool(client, 'browser_close', {}); } catch { /* no session to close — OK */ }
+    // Give the browser process a moment to fully shut down before starting a new session
+    await sleep(1500);
+
     actionLog.push('Action: browser_run_code(script)');
     const runResult = await callTool(client, 'browser_run_code', { code: fnCode });
       const runText = textFromToolResult(runResult);
@@ -386,10 +391,10 @@ app.post('/execute', async (req, res) => {
         actionLog.push(runText);
       }
 
-      // Give the recorder a moment to capture the final UI state.
+      // Give the recorder a moment to capture the final UI state and flush the video.
       if (record_video) {
         try {
-          await callTool(client, 'browser_wait_for', { time: 1 });
+          await callTool(client, 'browser_wait_for', { time: 3 });
         } catch {
           // best-effort
         }
@@ -398,6 +403,8 @@ app.post('/execute', async (req, res) => {
         } catch {
           // best-effort
         }
+        // Wait for the video file to be flushed to disk after browser close
+        await sleep(2000);
       }
     });
 
@@ -429,6 +436,9 @@ app.post('/execute-test', async (req, res) => {
 
   try {
     await withMcpClient(async (client) => {
+      // Close any stale browser session from a previous run
+      try { await callTool(client, 'browser_close', {}); } catch { /* no session to close — OK */ }
+
       // Ensure viewport size is set for step-driven runs as well so recordings match expected resolution
       try {
         const prelude = `async (page) => { try { await page.setViewportSize({ width: ${VIDEO_WIDTH}, height: ${VIDEO_HEIGHT} }); } catch(e){} }`;

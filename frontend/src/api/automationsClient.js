@@ -2,7 +2,7 @@ import axios from 'axios';
 
 // jsconfig.json enables checkJs; cast import.meta to any for Vite env access.
 const viteEnv = /** @type {any} */ (import.meta).env;
-const AUTOMATIONS_URL = viteEnv?.VITE_AUTOMATIONS_URL || 'http://localhost:8006';
+const AUTOMATIONS_URL = '/svc/8006';
 
 const automationsAPI = {
   list: async (test_case_id = null, status = null, limit = 50, skip = 0) => {
