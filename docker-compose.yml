@@ -1,4 +1,15 @@
+x-shared-env: &shared-env
+  AUTH_ENABLED: "true"
+  AUTH_MODE: keycloak
+  AUTH_KEYCLOAK_URL: http://keycloak:8080
+  AUTH_KEYCLOAK_REALM: testmaster
+  AUTH_KEYCLOAK_CLIENT_ID: testmaster-app
+  RATE_LIMIT_ENABLED: "true"
+  RATE_LIMIT_DEFAULT: "120/minute"
+  RATE_LIMIT_STORAGE: "redis://redis:6379"
+
 services:
+  # ── Infrastructure ────────────────────────────────────────────────────
   mongo:
     image: mongo:7
     container_name: aitp-mongo
@@ -6,20 +17,92 @@ services:
       - "27017:27017"
     volumes:
       - mongo_data:/data/db
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
     networks:
       - app-network
 
+  redis:
+    image: redis:7-alpine
+    container_name: aitp-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+    networks:
+      - app-network
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    container_name: aitp-keycloak
+    command: start-dev --import-realm
+    environment:
+      - KC_BOOTSTRAP_ADMIN_USERNAME=admin
+      - KC_BOOTSTRAP_ADMIN_PASSWORD=admin
+      - KC_HTTP_PORT=8080
+      - KC_HEALTH_ENABLED=true
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./keycloak/testmaster-realm.json:/opt/keycloak/data/import/testmaster-realm.json:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/8080 && echo -e 'GET /health/ready HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && cat <&3 | grep -q '200\\|UP'"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    networks:
+      - app-network
+
+  nginx:
+    image: nginx:alpine
+    container_name: aitp-nginx
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    restart: unless-stopped
+    depends_on:
+      - frontend
+      - requirements
+      - testcases
+      - generator
+      - releases
+      - executions
+      - automations
+      - testcase-migration
+      - toabrkia
+      - git
+    networks:
+      - app-network
+
+  # ── Backend services ──────────────────────────────────────────────────
   requirements:
     build:
       context: .
       dockerfile: services/requirements/Dockerfile
     environment:
-      - MONGO_URL=mongodb://mongo:27017
-      - DB_NAME=aitp
+      MONGO_URL: mongodb://mongo:27017
+      DB_NAME: aitp
+      <<: *shared-env
     ports:
       - "8001:8000"
+    restart: unless-stopped
     depends_on:
       - mongo
+      - redis
+      - keycloak
     networks:
       - app-network
 
@@ -28,12 +111,16 @@ services:
       context: .
       dockerfile: services/testcases/Dockerfile
     environment:
-      - MONGO_URL=mongodb://mongo:27017
-      - DB_NAME=aitp
+      MONGO_URL: mongodb://mongo:27017
+      DB_NAME: aitp
+      <<: *shared-env
     ports:
       - "8002:8000"
+    restart: unless-stopped
     depends_on:
       - mongo
+      - redis
+      - keycloak
     networks:
       - app-network
 
@@ -42,26 +129,165 @@ services:
       context: .
       dockerfile: services/generator/Dockerfile
     environment:
-      - MONGO_URL=mongodb://mongo:27017
-      - DB_NAME=aitp
-      - REQUIREMENTS_SERVICE_URL=http://requirements:8000
-      - TESTCASES_SERVICE_URL=http://testcases:8000
-      - RELEASES_SERVICE_URL=http://releases:8000
-      - OLLAMA_URL=http://ollama:11434
-      - OLLAMA_MODEL=gpt-oss:20b
-      - OLLAMA_MCP_AGENT_URL=http://ollama-mcp-agent:3000
-      - AUTOMATIONS_SERVICE_URL=http://automations:8000
-      - PLAYWRIGHT_MCP_URL=http://playwright-mcp-agent:3000
+      MONGO_URL: mongodb://mongo:27017
+      DB_NAME: aitp
+      REQUIREMENTS_SERVICE_URL: http://requirements:8000
+      TESTCASES_SERVICE_URL: http://testcases:8000
+      RELEASES_SERVICE_URL: http://releases:8000
+      OLLAMA_URL: http://ollama:11434
+      OLLAMA_MODEL: gpt-oss:20b
+      OLLAMA_TEMPERATURE: "0"
+      OLLAMA_TOP_P: "1"
+      OLLAMA_MAX_TOKENS: "2048"
+      REJECT_INVALID_GENERATIONS: "true"
+      OLLAMA_MCP_AGENT_URL: http://ollama-mcp-agent:3000
+      AUTOMATIONS_SERVICE_URL: http://automations:8000
+      PLAYWRIGHT_MCP_URL: http://playwright-mcp-agent:3000
+      <<: *shared-env
     ports:
       - "8003:8000"
+    restart: unless-stopped
     depends_on:
       - mongo
+      - redis
+      - keycloak
       - requirements
       - testcases
       - ollama
     networks:
       - app-network
 
+  releases:
+    build:
+      context: .
+      dockerfile: services/releases/Dockerfile
+    environment:
+      MONGO_URL: mongodb://mongo:27017
+      DB_NAME: aitp
+      <<: *shared-env
+    ports:
+      - "8004:8000"
+    restart: unless-stopped
+    depends_on:
+      - mongo
+      - redis
+      - keycloak
+    networks:
+      - app-network
+
+  executions:
+    build:
+      context: .
+      dockerfile: services/executions/Dockerfile
+    environment:
+      MONGO_URL: mongodb://mongo:27017
+      DB_NAME: aitp
+      <<: *shared-env
+    ports:
+      - "8005:8000"
+    restart: unless-stopped
+    depends_on:
+      - mongo
+      - redis
+      - keycloak
+    networks:
+      - app-network
+
+  toabrkia:
+    build:
+      context: .
+      dockerfile: services/toabrkia/Dockerfile
+    environment:
+      MONGO_URL: mongodb://mongo:27017
+      DB_NAME: aitp
+      <<: *shared-env
+    ports:
+      - "8008:8000"
+    restart: unless-stopped
+    depends_on:
+      - mongo
+      - redis
+      - keycloak
+    networks:
+      - app-network
+
+  testcase-migration:
+    build:
+      context: .
+      dockerfile: services/testcase-migration/Dockerfile
+    environment:
+      TESTCASES_SERVICE_URL: http://testcases:8000
+      GENERATOR_SERVICE_URL: http://generator:8000
+      AUTOMATIONS_SERVICE_URL: http://automations:8000
+      OLLAMA_URL: http://ollama:11434
+      OLLAMA_MODEL: gpt-oss:20b
+      MIGRATION_REQUIREMENT_ID: unlinked
+      OLLAMA_TEMPERATURE: "0"
+      OLLAMA_TOP_P: "1"
+      OLLAMA_MAX_TOKENS: "2048"
+      <<: *shared-env
+    ports:
+      - "8009:8000"
+    restart: unless-stopped
+    depends_on:
+      - testcases
+      - generator
+      - automations
+      - ollama
+      - redis
+      - keycloak
+    networks:
+      - app-network
+
+  automations:
+    build:
+      context: .
+      dockerfile: services/automations/Dockerfile
+    environment:
+      MONGO_URL: mongodb://mongo:27017
+      DB_NAME: aitp
+      PLAYWRIGHT_MCP_URL: http://playwright-mcp-agent:3000
+      EXECUTIONS_SERVICE_URL: http://executions:8000
+      <<: *shared-env
+    ports:
+      - "8006:8000"
+    restart: unless-stopped
+    volumes:
+      - automation_videos:/videos
+    depends_on:
+      - mongo
+      - redis
+      - keycloak
+      - playwright-mcp-agent
+      - executions
+    networks:
+      - app-network
+
+  git:
+    build:
+      context: .
+      dockerfile: services/git/Dockerfile
+    environment:
+      WORKSPACE_DIR: /workspace
+      SSH_KEYS_DIR: /ssh-keys
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      GITLAB_TOKEN: ${GITLAB_TOKEN:-}
+      AZURE_DEVOPS_TOKEN: ${AZURE_DEVOPS_TOKEN:-}
+      AZURE_DEVOPS_ORG: ${AZURE_DEVOPS_ORG:-}
+      <<: *shared-env
+    ports:
+      - "8007:8000"
+    restart: unless-stopped
+    volumes:
+      - git_workspace:/workspace
+      - git_ssh_keys:/ssh-keys
+    depends_on:
+      - redis
+      - keycloak
+    networks:
+      - app-network
+
+  # ── LLM ───────────────────────────────────────────────────────────────
   ollama:
     image: ollama/ollama:latest
     ports:
@@ -75,6 +301,11 @@ services:
       - OLLAMA_VULKAN=0
     runtime: nvidia
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
     networks:
       - app-network
 
@@ -88,95 +319,40 @@ services:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
 
-  releases:
+  ollama-mcp-agent:
     build:
       context: .
-      dockerfile: services/releases/Dockerfile
-    environment:
-      - MONGO_URL=mongodb://mongo:27017
-      - DB_NAME=aitp
+      dockerfile: services/ollama-mcp-agent/Dockerfile
+    container_name: ollama-mcp-agent
     ports:
-      - "8004:8000"
-    depends_on:
-      - mongo
-    networks:
-      - app-network
-
-  executions:
-    build:
-      context: .
-      dockerfile: services/executions/Dockerfile
-    environment:
-      - MONGO_URL=mongodb://mongo:27017
-      - DB_NAME=aitp
-    ports:
-      - "8005:8000"
-    depends_on:
-      - mongo
-    networks:
-      - app-network
-
-  toabrkia:
-    build:
-      context: .
-      dockerfile: services/toabrkia/Dockerfile
-    environment:
-      - MONGO_URL=mongodb://mongo:27017
-      - DB_NAME=aitp
-    ports:
-      - "8008:8000"
-    depends_on:
-      - mongo
-    networks:
-      - app-network
-
-  testcase-migration:
-    build:
-      context: .
-      dockerfile: services/testcase-migration/Dockerfile
-    environment:
-      - TESTCASES_SERVICE_URL=http://testcases:8000
-      - GENERATOR_SERVICE_URL=http://generator:8000
-      - AUTOMATIONS_SERVICE_URL=http://automations:8000
-      - OLLAMA_URL=http://ollama:11434
-      - OLLAMA_MODEL=gpt-oss:20b
-      - MIGRATION_REQUIREMENT_ID=unlinked
-    ports:
-      - "8009:8000"
-    depends_on:
-      - testcases
-      - generator
-      - automations
-      - ollama
-    networks:
-      - app-network
-
-  automations:
-    build:
-      context: .
-      dockerfile: services/automations/Dockerfile
-    environment:
-      - MONGO_URL=mongodb://mongo:27017
-      - DB_NAME=aitp
-      - PLAYWRIGHT_MCP_URL=http://playwright-mcp-agent:3000
-      - EXECUTIONS_SERVICE_URL=http://executions:8000
-    ports:
-      - "8006:8000"
+      - "3002:3000"
     volumes:
       - automation_videos:/videos
-    depends_on:
-      - mongo
-      - playwright-mcp-agent
-      - executions
+    environment:
+      - PORT=3000
+      - OLLAMA_URL=http://ollama:11434
+      - OLLAMA_MODEL=gpt-oss:20b
+      - OLLAMA_TEMPERATURE=0
+      - OLLAMA_TOP_P=1
+      - OLLAMA_MAX_TOKENS=2048
+      - PLAYWRIGHT_MCP_OFFICIAL_URL=http://playwright-mcp-core-1:8931/mcp
+      - VIDEO_PATH=/videos
+      - MAX_ITERATIONS=12
+      - MAX_TOOL_CALLS_PER_ITERATION=8
     networks:
       - app-network
+    restart: unless-stopped
+    depends_on:
+      - ollama
+      - playwright-mcp-core-1
 
-  playwright-mcp-core:
+  # ── Playwright pool (3 browser instances) ─────────────────────────────
+  playwright-mcp-core-1:
     image: mcr.microsoft.com/playwright/mcp:latest
-    container_name: playwright-mcp-core
+    container_name: playwright-mcp-core-1
     user: "0:0"
     entrypoint: ["node"]
-    command:
+    command: &pw-cmd
       - cli.js
       - --headless
       - --browser
@@ -198,6 +374,41 @@ services:
     networks:
       - app-network
     restart: unless-stopped
+    healthcheck: &pw-health
+      test: ["CMD", "curl", "-f", "http://localhost:8931/health"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+
+  playwright-mcp-core-2:
+    image: mcr.microsoft.com/playwright/mcp:latest
+    container_name: playwright-mcp-core-2
+    user: "0:0"
+    entrypoint: ["node"]
+    command: *pw-cmd
+    ports:
+      - "8932:8931"
+    volumes:
+      - automation_videos:/videos
+    networks:
+      - app-network
+    restart: unless-stopped
+    healthcheck: *pw-health
+
+  playwright-mcp-core-3:
+    image: mcr.microsoft.com/playwright/mcp:latest
+    container_name: playwright-mcp-core-3
+    user: "0:0"
+    entrypoint: ["node"]
+    command: *pw-cmd
+    ports:
+      - "8933:8931"
+    volumes:
+      - automation_videos:/videos
+    networks:
+      - app-network
+    restart: unless-stopped
+    healthcheck: *pw-health
 
   playwright-mcp-agent:
     build:
@@ -211,43 +422,30 @@ services:
     environment:
       - VIDEO_PATH=/videos
       - PORT=3000
-      - PLAYWRIGHT_MCP_OFFICIAL_URL=http://playwright-mcp-core:8931/mcp
+      # Comma-separated pool of Playwright MCP core URLs
+      - PLAYWRIGHT_MCP_POOL=http://playwright-mcp-core-1:8931/mcp,http://playwright-mcp-core-2:8931/mcp,http://playwright-mcp-core-3:8931/mcp
+      - PLAYWRIGHT_MCP_OFFICIAL_URL=http://playwright-mcp-core-1:8931/mcp
     networks:
       - app-network
     restart: unless-stopped
     depends_on:
-      - playwright-mcp-core
+      - playwright-mcp-core-1
+      - playwright-mcp-core-2
+      - playwright-mcp-core-3
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
 
-  ollama-mcp-agent:
-    build:
-      context: .
-      dockerfile: services/ollama-mcp-agent/Dockerfile
-    container_name: ollama-mcp-agent
-    ports:
-      - "3002:3000"
-    volumes:
-      - automation_videos:/videos
-    environment:
-      - PORT=3000
-      - OLLAMA_URL=http://ollama:11434
-      - OLLAMA_MODEL=gpt-oss:20b
-      - PLAYWRIGHT_MCP_OFFICIAL_URL=http://playwright-mcp-core:8931/mcp
-      - VIDEO_PATH=/videos
-      - MAX_ITERATIONS=12
-      - MAX_TOOL_CALLS_PER_ITERATION=8
-    networks:
-      - app-network
-    restart: unless-stopped
-    depends_on:
-      - ollama
-      - playwright-mcp-core
-
+  # ── Frontend ──────────────────────────────────────────────────────────
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
     ports:
       - "5173:5173"
+    restart: unless-stopped
     volumes:
       - ./frontend/src:/app/src
       - ./frontend/index.html:/app/index.html
@@ -260,27 +458,12 @@ services:
       - executions
       - toabrkia
       - generator
+      - keycloak
     environment:
       - VITE_API_BASE_URL=http://localhost:8001
-    networks:
-      - app-network
-
-  git:
-    build:
-      context: .
-      dockerfile: services/git/Dockerfile
-    environment:
-      - WORKSPACE_DIR=/workspace
-      - SSH_KEYS_DIR=/ssh-keys
-      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
-      - GITLAB_TOKEN=${GITLAB_TOKEN:-}
-      - AZURE_DEVOPS_TOKEN=${AZURE_DEVOPS_TOKEN:-}
-      - AZURE_DEVOPS_ORG=${AZURE_DEVOPS_ORG:-}
-    ports:
-      - "8007:8000"
-    volumes:
-      - git_workspace:/workspace
-      - git_ssh_keys:/ssh-keys
+      - VITE_KEYCLOAK_URL=http://localhost:8080
+      - VITE_KEYCLOAK_REALM=testmaster
+      - VITE_KEYCLOAK_CLIENT_ID=testmaster-app
     networks:
       - app-network
 
@@ -290,6 +473,7 @@ volumes:
   automation_videos:
   git_workspace:
   git_ssh_keys:
+  redis_data:
 
 networks:
   app-network:

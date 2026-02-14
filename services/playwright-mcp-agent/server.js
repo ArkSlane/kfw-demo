@@ -11,7 +11,20 @@ app.use(express.json({ limit: '2mb' }));
 
 const PORT = Number(process.env.PORT || 3000);
 const VIDEO_DIR = process.env.VIDEO_PATH || '/videos';
-const OFFICIAL_MCP_URL = process.env.PLAYWRIGHT_MCP_OFFICIAL_URL || 'http://playwright-mcp-core:8931/mcp';
+const OFFICIAL_MCP_URL = process.env.PLAYWRIGHT_MCP_OFFICIAL_URL || 'http://playwright-mcp-core-1:8931/mcp';
+
+// ── Playwright core pool (round-robin) ──────────────────────────────────
+const MCP_POOL = (process.env.PLAYWRIGHT_MCP_POOL || OFFICIAL_MCP_URL)
+  .split(',')
+  .map((u) => u.trim())
+  .filter(Boolean);
+let _poolIndex = 0;
+
+function nextMcpUrl() {
+  const url = MCP_POOL[_poolIndex % MCP_POOL.length];
+  _poolIndex = (_poolIndex + 1) % MCP_POOL.length;
+  return url;
+}
 
 // Desired recorded video resolution (used to set viewport size before running scripts)
 const VIDEO_WIDTH = Number(process.env.VIDEO_WIDTH || 1280);
@@ -201,8 +214,9 @@ async function maybeRenameNewestVideo({ runStartedAt, video_path }) {
 }
 
 async function withMcpClient(fn) {
+  const mcpUrl = nextMcpUrl();
   const client = new Client({ name: 'ai-testing-v2-playwright-mcp-agent', version: '1.0.0' });
-  const transport = new StreamableHTTPClientTransport(new URL(OFFICIAL_MCP_URL));
+  const transport = new StreamableHTTPClientTransport(new URL(mcpUrl));
   try {
     await client.connect(transport);
     return await fn(client);
