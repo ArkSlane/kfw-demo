@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, Literal
 
@@ -13,10 +14,20 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from shared.errors import setup_all_error_handlers
 from shared.health import aggregate_health_status, check_http_service, check_ollama
+from shared.settings import CORS_ORIGINS, LOG_LEVEL, LOG_FORMAT_JSON
+from shared.logging_config import setup_logging, get_logger
+from shared.auth import setup_auth
+from shared.rate_limit import setup_rate_limiting
+
+logger = get_logger(__name__)
 
 
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gpt-oss:20b")
+# Deterministic sampling params
+OLLAMA_TEMPERATURE = float(os.getenv("OLLAMA_TEMPERATURE", "0"))
+OLLAMA_TOP_P = float(os.getenv("OLLAMA_TOP_P", "1"))
+OLLAMA_MAX_TOKENS = int(os.getenv("OLLAMA_MAX_TOKENS", "2048"))
 
 TESTCASES_URL = os.getenv("TESTCASES_SERVICE_URL", "http://testcases:8000")
 GENERATOR_URL = os.getenv("GENERATOR_SERVICE_URL", "http://generator:8000")
@@ -190,7 +201,14 @@ async def _ollama_json(prompt: str) -> dict:
     async with httpx.AsyncClient(timeout=60) as client:
         resp = await client.post(
             f"{OLLAMA_URL}/api/generate",
-            json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False},
+            json={
+                "model": OLLAMA_MODEL,
+                "prompt": prompt,
+                "stream": False,
+                "temperature": float(OLLAMA_TEMPERATURE),
+                "top_p": float(OLLAMA_TOP_P),
+                "max_tokens": int(OLLAMA_MAX_TOKENS),
+            },
         )
         resp.raise_for_status()
         data = resp.json()
@@ -202,7 +220,16 @@ async def _ollama_json(prompt: str) -> dict:
         return json.loads(json_text)
 
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    setup_logging("testcase-migration", level=LOG_LEVEL, json_output=LOG_FORMAT_JSON)
+    logger.info("Testcase Migration service ready")
+    yield
+    logger.info("Testcase Migration service stopped")
+
+
 app = FastAPI(
+    lifespan=lifespan,
     title="Testcase Migration Service",
     version="1.0.0",
     description=(
@@ -215,9 +242,12 @@ app = FastAPI(
 
 setup_all_error_handlers(app)
 
+# Production middleware: auth, rate limiting, CORS
+setup_auth(app)
+setup_rate_limiting(app)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000"],
+    allow_origins=CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

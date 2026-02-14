@@ -4,11 +4,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from contextlib import asynccontextmanager
 from bson import ObjectId
-from shared.db import get_db
+from shared.db import get_db, close_client
 from shared.errors import setup_all_error_handlers
 from shared.health import check_mongodb, check_playwright_mcp, aggregate_health_status
-from shared.settings import MONGO_URL, DB_NAME
-from pydantic import BaseModel
+from shared.settings import MONGO_URL, DB_NAME, CORS_ORIGINS, LOG_LEVEL, LOG_FORMAT_JSON, validate_settings
+from shared.logging_config import setup_logging, get_logger
+from shared.auth import setup_auth
+from shared.rate_limit import setup_rate_limiting
+from shared.indexes import ensure_indexes
+from pydantic import BaseModel, Field
 from typing import Optional, Literal
 import os
 import httpx
@@ -17,9 +21,7 @@ import logging
 from pathlib import Path
 import re
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # Constants
 VIDEOS_DIR = "/videos"  # Must match playwright-mcp mount point
@@ -119,19 +121,23 @@ async def cleanup_old_videos():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup and shutdown events"""
+    setup_logging("automations", level=LOG_LEVEL, json_output=LOG_FORMAT_JSON)
+    validate_settings()
+    await ensure_indexes(get_db(), ["automations"])
     # Startup: Create cleanup task
     cleanup_task = asyncio.create_task(cleanup_old_videos())
-    logger.info(f"Video cleanup task started (retention: {VIDEO_RETENTION_DAYS} days, interval: {CLEANUP_INTERVAL_HOURS} hours)")
+    logger.info(f"Automations service ready (video retention: {VIDEO_RETENTION_DAYS}d, cleanup interval: {CLEANUP_INTERVAL_HOURS}h)")
     
     yield
     
-    # Shutdown: Cancel cleanup task
+    # Shutdown: Cancel cleanup task and close DB
     cleanup_task.cancel()
     try:
         await cleanup_task
     except asyncio.CancelledError:
         pass
-    logger.info("Video cleanup task stopped")
+    await close_client()
+    logger.info("Automations service stopped")
 
 app = FastAPI(
     title="Test Automation Service",
@@ -166,10 +172,12 @@ app = FastAPI(
 # Setup standardized error handlers
 setup_all_error_handlers(app)
 
-# Enable CORS for frontend
+# Production middleware: auth, rate limiting, CORS
+setup_auth(app)
+setup_rate_limiting(app)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000"],
+    allow_origins=CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -182,25 +190,25 @@ AutomationStatus = Literal["not_started", "in_progress", "passing", "failing", "
 AutomationFramework = Literal["playwright", "selenium", "cypress", "pytest", "other"]
 
 class AutomationCreate(BaseModel):
-    test_case_id: str
-    title: str
+    test_case_id: str = Field(..., max_length=50)
+    title: str = Field(..., max_length=500)
     framework: AutomationFramework = "playwright"
-    script: str
+    script: str = Field(..., max_length=200000)
     status: AutomationStatus = "not_started"
-    notes: Optional[str] = None
-    video_path: Optional[str] = None
-    last_actions: Optional[str] = None
+    notes: Optional[str] = Field(None, max_length=10000)
+    video_path: Optional[str] = Field(None, max_length=500)
+    last_actions: Optional[str] = Field(None, max_length=100000)
     metadata: dict = {}
 
 class AutomationUpdate(BaseModel):
-    title: Optional[str] = None
+    title: Optional[str] = Field(None, max_length=500)
     framework: Optional[AutomationFramework] = None
-    script: Optional[str] = None
+    script: Optional[str] = Field(None, max_length=200000)
     status: Optional[AutomationStatus] = None
-    notes: Optional[str] = None
-    last_run_result: Optional[str] = None
+    notes: Optional[str] = Field(None, max_length=10000)
+    last_run_result: Optional[str] = Field(None, max_length=10000)
     last_run_at: Optional[datetime] = None
-    video_path: Optional[str] = None
+    video_path: Optional[str] = Field(None, max_length=500)
     metadata: Optional[dict] = None
 
 class AutomationOut(AutomationCreate):
