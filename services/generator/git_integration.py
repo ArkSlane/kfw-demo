@@ -21,7 +21,8 @@ async def push_test_to_git(
     provider: Literal["github", "gitlab", "azure"],
     repo_url: str | None = None,
     base_branch: str | None = None,
-    ssh_key_name: str | None = None
+    ssh_key_name: str | None = None,
+    auth_headers: dict | None = None
 ) -> dict:
     """
     Push a generated Playwright test to a Git repository and create a PR/MR.
@@ -34,6 +35,7 @@ async def push_test_to_git(
         repo_url: Repository URL (uses env var if None)
         base_branch: Base branch to create PR from (uses env var if None)
         ssh_key_name: SSH key name for authentication (optional)
+        auth_headers: Authorization headers for service-to-service calls
     
     Returns:
         dict with keys: success, pr_url, branch_name, file_path
@@ -44,7 +46,7 @@ async def push_test_to_git(
     if not repo_url:
         raise ValueError("TESTS_REPO_URL environment variable not set and no repo_url provided")
     
-    async with httpx.AsyncClient(timeout=120) as client:
+    async with httpx.AsyncClient(timeout=120, headers=auth_headers or {}) as client:
         # 1. Clone repository (or pull if exists)
         repo_name = Path(repo_url).stem.replace('.git', '')
         

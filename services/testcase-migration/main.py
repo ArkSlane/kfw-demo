@@ -8,11 +8,17 @@ from datetime import datetime, timezone
 from typing import Any, Literal
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field
 
 from shared.errors import setup_all_error_handlers
+
+
+def _fwd_headers(request: Request) -> dict:
+    """Extract Authorization header for service-to-service forwarding."""
+    auth = request.headers.get("authorization", "")
+    return {"Authorization": auth} if auth else {}
 from shared.health import aggregate_health_status, check_http_service, check_ollama
 from shared.settings import CORS_ORIGINS, LOG_LEVEL, LOG_FORMAT_JSON
 from shared.logging_config import setup_logging, get_logger
@@ -309,7 +315,7 @@ async def analyze(payload: AnalyzeRequest):
 
 
 @app.post("/generate-automation-draft", response_model=GenerateAutomationDraftResponse)
-async def generate_automation_draft(payload: GenerateAutomationDraftRequest):
+async def generate_automation_draft(payload: GenerateAutomationDraftRequest, request: Request):
     # 1) Create a draft testcase in the testcases service (needed because generator expects an id)
     tc = payload.testcase
     steps = tc.steps or []
@@ -332,7 +338,7 @@ async def generate_automation_draft(payload: GenerateAutomationDraftRequest):
         },
     }
 
-    async with httpx.AsyncClient(timeout=300) as client:
+    async with httpx.AsyncClient(timeout=300, headers=_fwd_headers(request)) as client:
         created = await client.post(f"{TESTCASES_URL}/testcases", json=tc_create)
         if created.status_code not in (200, 201):
             raise HTTPException(status_code=created.status_code, detail=created.text)
@@ -355,7 +361,7 @@ async def generate_automation_draft(payload: GenerateAutomationDraftRequest):
 
 
 @app.post("/save", response_model=SaveMigrationResponse)
-async def save(payload: SaveMigrationRequest):
+async def save(payload: SaveMigrationRequest, request: Request):
     testcase_id = (payload.testcase_id or "").strip()
     if not testcase_id:
         raise HTTPException(status_code=400, detail="testcase_id is required")
@@ -393,7 +399,7 @@ async def save(payload: SaveMigrationRequest):
         },
     }
 
-    async with httpx.AsyncClient(timeout=60) as client:
+    async with httpx.AsyncClient(timeout=60, headers=_fwd_headers(request)) as client:
         updated = await client.put(f"{TESTCASES_URL}/testcases/{testcase_id}", json=tc_patch)
         if updated.status_code != 200:
             raise HTTPException(status_code=updated.status_code, detail=updated.text)

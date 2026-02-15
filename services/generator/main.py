@@ -1,25 +1,232 @@
 import os
 import json
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Literal
 import re
 from urllib.parse import urlparse
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, ValidationError, ConfigDict, field_validator
 import httpx
 import asyncio
+from bson import ObjectId
+from shared.db import get_db, close_client
 from shared.models import GenerateRequest, GenerateResult, TestcaseOut
 from shared.errors import setup_all_error_handlers
 from shared.health import check_ollama, check_playwright_mcp, check_http_service, aggregate_health_status
+from shared.settings import CORS_ORIGINS, LOG_LEVEL, LOG_FORMAT_JSON, validate_settings
+from shared.logging_config import setup_logging, get_logger
+from shared.auth import setup_auth
+
+
+def _fwd_headers(request: Request) -> dict:
+    """Extract Authorization header for service-to-service forwarding."""
+    auth = request.headers.get("authorization", "")
+    return {"Authorization": auth} if auth else {}
+from shared.rate_limit import setup_rate_limiting
+from shared.indexes import ensure_indexes
 from git_integration import push_test_to_git, trigger_test_execution
 
+logger = get_logger(__name__)
+
+# Ollama configuration
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1")
+# Default model aligned with docker-compose (keep in sync)
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gpt-oss:20b")
+# Deterministic model sampling params to reduce nondeterministic outputs
+OLLAMA_TEMPERATURE = float(os.getenv("OLLAMA_TEMPERATURE", "0"))
+OLLAMA_TOP_P = float(os.getenv("OLLAMA_TOP_P", "1"))
+OLLAMA_MAX_TOKENS = int(os.getenv("OLLAMA_MAX_TOKENS", "2048"))
 AUTOMATIONS_URL = os.getenv("AUTOMATIONS_SERVICE_URL", "http://automations:8000")
 PLAYWRIGHT_MCP_URL = os.getenv("PLAYWRIGHT_MCP_URL", "http://playwright-mcp-agent:3000")
 OLLAMA_MCP_AGENT_URL = os.getenv("OLLAMA_MCP_AGENT_URL", "http://ollama-mcp-agent:3000")
 RELEASES_URL = os.getenv("RELEASES_SERVICE_URL", "http://localhost:8004")
+
+# ---------------------------------------------------------------------------
+# App Knowledge Graph — static map of the frontend UI for LLM context
+# ---------------------------------------------------------------------------
+# This gives the LLM immediate, accurate awareness of every page/route,
+# navigation elements, button labels, selector strategies, and API endpoints
+# so it can generate correct Playwright code without needing a live DOM snapshot.
+# Maintaining this in code is cheaper than an MCP round-trip per step.
+
+APP_KNOWLEDGE_GRAPH: dict = {
+    "app_name": "TestMaster",
+    "framework": "React + Vite + shadcn/ui (Tailwind)",
+    "base_url_docker": "http://frontend:5173",
+    "selector_strategy": (
+        "No data-testid attributes exist. "
+        "Use role-based selectors: page.getByRole('button', {name:'...'}), page.getByRole('link', {name:'...'}), page.getByRole('heading', {name:'...'}). "
+        "Use text selectors: page.getByText('exact text'). "
+        "Use CSS when roles are ambiguous: page.locator('.class-name'), page.locator('input[placeholder=\"...\"]')."
+    ),
+    "layout": {
+        "sidebar": {
+            "description": "Left sidebar with navigation links. Always visible on desktop, toggleable on mobile.",
+            "header": "TestMaster logo + 'QA Management' subtitle",
+            "toggle_button": "aria-label='Toggle Sidebar'",
+            "nav_items": [
+                {"label": "Test Plan", "route": "/TestPlan"},
+                {"label": "AI Insights", "route": "/AIInsights"},
+                {"label": "Releases", "route": "/Releases"},
+                {"label": "TOAB/RK/IA", "route": "/toab-rk-ia"},
+                {"label": "Requirements", "route": "/Requirements"},
+                {"label": "Test Cases", "route": "/TestCases"},
+                {"label": "Testcase Migration", "route": "/testcase-migration"},
+                {"label": "Automations", "route": "/Automations"},
+                {"label": "Executions", "route": "/Executions"},
+            ],
+            "footer_items": [{"label": "Admin", "route": "/admin"}],
+        },
+    },
+    "pages": {
+        "/TestPlan": {
+            "description": "Dashboard overview — stats, charts, requirement/testcase lists",
+            "also": "/ (default route)",
+            "key_buttons": ["New Requirement", "New Test Case"],
+            "filters": ["Release filter (popover + checkboxes)", "View mode: list/board"],
+            "interactive": ["StatsCard components", "Paginated requirement/testcase lists", "TestCasesByRequirement chart"],
+        },
+        "/Requirements": {
+            "description": "List/manage requirements. Create, edit, delete, AI-generate test suites.",
+            "key_buttons": ["New Requirement", "AI Test Suite", "Quick Test", "Delete (trash icon per card)"],
+            "filters": ["Filter by Release (Select dropdown)"],
+            "dialogs": ["RequirementDialog (create/edit)", "AdvancedAITestDialog (AI Test Suite)", "TestCaseDialog (Quick Test)", "Delete AlertDialog"],
+            "empty_state": "Text 'Create your first requirement'",
+        },
+        "/TestCases": {
+            "description": "List/manage test cases. Generate automations, execute tests.",
+            "key_buttons": ["New Test Case", "Generate Automation (sparkles icon)", "Execute", "AI Generate", "Delete (trash icon)"],
+            "filters": ["Filter by Requirement (Select)", "Filter by Release (Select)", "Tabs: All / Draft / Ready / Passed / Failed"],
+            "dialogs": ["TestCaseDialog", "ManualExecutionDialog", "AutomationReviewDialog", "Delete AlertDialog"],
+        },
+        "/Automations": {
+            "description": "List/manage automation scripts. Execute, view video/actions.",
+            "key_buttons": ["New Automation", "Execute", "View Result", "Watch Video", "View Actions", "Delete (trash icon)"],
+            "filters": ["Filter by Test Case (Select)", "Tabs: All / Ready / Passing / Failing"],
+            "dialogs": ["AutomationDialog", "Video Dialog", "Actions Dialog", "Delete AlertDialog"],
+        },
+        "/Releases": {
+            "description": "Manage releases.",
+            "key_buttons": ["New Release", "Delete (trash icon)"],
+            "dialogs": ["ReleaseDialog", "Delete AlertDialog"],
+            "empty_state": "Text 'Create your first release'",
+        },
+        "/Executions": {
+            "description": "View execution results. Filter by release, status.",
+            "key_buttons": ["API Documentation", "View Steps", "Edit"],
+            "filters": ["Filter by Release (Select)", "Tabs: All / Passed / Failed / Blocked", "View: all / manual / automated"],
+            "stats": ["Total, Passed, Failed, Blocked, Pass Rate cards"],
+            "dialogs": ["ExecutionDialog", "ExecutionDetailsDialog", "ApiInfoDialog"],
+        },
+        "/AIInsights": {
+            "description": "AI-powered test analytics dashboard (mock data).",
+            "key_buttons": ["Generate AI Insights", "Get Started", "Refresh Analysis"],
+            "sections": ["Priority Actions", "Failure Patterns", "Root Causes", "Stability/Coverage"],
+        },
+        "/toab-rk-ia": {
+            "description": "TOAB/RK/IA assessment management linked to releases.",
+            "key_buttons": ["Create", "Delete (trash icon)"],
+            "filters": ["Filter by Release (Select)"],
+            "dialogs": ["ToabRkIaDialog", "Delete AlertDialog"],
+        },
+        "/testcase-migration": {
+            "description": "4-step wizard: paste legacy code → testcase draft → automation draft → save.",
+            "key_buttons": ["Analyze", "Generate automation draft", "Execute", "Save", "Back", "Reset"],
+            "form_fields": ["Textarea (legacy code)", "Input (title)", "Textarea (description/preconditions)", "Step editor (add/remove)"],
+        },
+        "/admin": {
+            "description": "Administration: tokens, repos, users, health, AI settings.",
+            "tabs": ["API tokens", "Repo connections", "User management", "Service health", "AI inclusion", "Test approach"],
+            "key_buttons": ["Save token", "Connect", "Add user", "Save", "Delete (per-row)"],
+        },
+    },
+    "common_button_labels": [
+        "New Requirement", "New Test Case", "New Automation", "New Release", "Create",
+        "AI Test Suite", "Quick Test", "Generate Automation", "Execute", "View Result",
+        "Watch Video", "View Actions", "View Steps", "Edit", "Delete", "Cancel",
+        "Generate AI Insights", "Get Started", "Refresh Analysis",
+        "API Documentation", "Save token", "Connect", "Save", "Analyze", "Back", "Reset",
+    ],
+    "aria_labels": [
+        "Toggle Sidebar", "Move step up", "Move step down", "Remove step",
+        "breadcrumb", "pagination", "Go to previous page", "Go to next page",
+    ],
+}
+
+
+def _build_knowledge_graph_prompt_block(steps_text: str = "", kg: dict | None = None) -> str:
+    """Build a compact prompt block from the knowledge graph, focused on pages
+    the test steps are likely to touch.
+
+    If *steps_text* mentions specific pages/routes, only include those pages
+    to keep the prompt short. Otherwise include a summary of all pages.
+
+    *kg* can be a DB-loaded knowledge graph dict.  When ``None``, falls back
+    to the hardcoded ``APP_KNOWLEDGE_GRAPH``.
+    """
+    if kg is None:
+        kg = APP_KNOWLEDGE_GRAPH
+    lines: list[str] = [
+        f"Application: {kg['app_name']} ({kg['framework']})",
+        f"Docker base URL: {kg['base_url_docker']}",
+        f"Selector strategy: {kg['selector_strategy']}",
+        "",
+        "Sidebar navigation links (use page.getByRole('link', {{name: '<label>'}}) to click):",
+    ]
+    for item in kg["layout"]["sidebar"]["nav_items"]:
+        lines.append(f"  - '{item['label']}' → {item['route']}")
+    lines.append(f"  - 'Admin' → /admin  (sidebar footer)")
+    lines.append("")
+
+    # Determine which pages are relevant based on step text
+    lower_steps = (steps_text or "").lower()
+    relevant_pages = {}
+    for route, info in kg["pages"].items():
+        # Include a page if steps mention its route, name, or key words
+        route_lower = route.lower().strip("/")
+        desc_lower = info.get("description", "").lower()
+        # Always include: mentioned in steps or generic/short test
+        keywords = [route_lower, route_lower.replace("/", "")]
+        # Add page-specific keywords
+        if "requirement" in route_lower:
+            keywords.extend(["requirement", "requirements"])
+        if "testcase" in route_lower or "test" in route_lower:
+            keywords.extend(["test case", "testcase", "test cases"])
+        if "automation" in route_lower:
+            keywords.extend(["automation", "automations"])
+        if "release" in route_lower:
+            keywords.extend(["release", "releases"])
+        if "execution" in route_lower:
+            keywords.extend(["execution", "executions", "execute"])
+
+        if not lower_steps or any(kw in lower_steps for kw in keywords):
+            relevant_pages[route] = info
+
+    # If nothing matched or very few steps, include all pages (compact)
+    if len(relevant_pages) == 0:
+        relevant_pages = kg["pages"]
+
+    for route, info in relevant_pages.items():
+        lines.append(f"Page: {route}")
+        lines.append(f"  Description: {info.get('description', '')}")
+        if info.get("also"):
+            lines.append(f"  Also: {info['also']}")
+        if info.get("key_buttons"):
+            lines.append(f"  Buttons: {', '.join(info['key_buttons'])}")
+        if info.get("filters"):
+            lines.append(f"  Filters: {', '.join(info['filters'])}")
+        if info.get("dialogs"):
+            lines.append(f"  Dialogs: {', '.join(info['dialogs'])}")
+        if info.get("empty_state"):
+            lines.append(f"  Empty state: {info['empty_state']}")
+        lines.append("")
+
+    lines.append(f"Common button labels: {', '.join(kg['common_button_labels'][:15])}...")
+    lines.append(f"Known aria-labels: {', '.join(kg['aria_labels'])}")
+
+    return "\n".join(lines)
 
 # DTOs for automation generation
 class TestStep(BaseModel):
@@ -105,8 +312,54 @@ class GitPushRequest(BaseModel):
 REQ_URL = os.getenv("REQUIREMENTS_SERVICE_URL", "http://localhost:8001")
 TC_URL = os.getenv("TESTCASES_SERVICE_URL", "http://localhost:8002")
 INTERNAL_FRONTEND_BASE_URL = os.getenv("INTERNAL_FRONTEND_BASE_URL", "http://frontend:5173")
+# Toggle whether invalid LLM outputs should be rejected (HTTP 502) or allowed to fallback
+REJECT_INVALID_GENERATIONS = os.getenv("REJECT_INVALID_GENERATIONS", "true").lower() in ("1", "true", "yes")
+
+# Knowledge Graph collection name (used by startup seeder + CRUD endpoints)
+KG_COLLECTION = "knowledge_graphs"
+
+
+async def _seed_default_knowledge_graph():
+    """Seed the hardcoded APP_KNOWLEDGE_GRAPH into MongoDB if the collection is empty."""
+    try:
+        db = get_db()
+        count = await db[KG_COLLECTION].count_documents({})
+        if count > 0:
+            return  # already seeded
+        kg = APP_KNOWLEDGE_GRAPH
+        doc = {
+            "app_name": kg["app_name"],
+            "framework": kg["framework"],
+            "base_url": kg["base_url_docker"],
+            "selector_strategy": kg["selector_strategy"],
+            "nav_items": kg["layout"]["sidebar"]["nav_items"],
+            "pages": kg["pages"],
+            "common_button_labels": kg["common_button_labels"],
+            "aria_labels": kg["aria_labels"],
+            "is_default": True,
+            "created_at": datetime.now(timezone.utc),
+            "updated_at": datetime.now(timezone.utc),
+        }
+        await db[KG_COLLECTION].insert_one(doc)
+        logger.info("Seeded default knowledge graph for %s", kg["app_name"])
+    except Exception as e:
+        logger.warning("Failed to seed knowledge graph: %s", e)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    setup_logging("generator", level=LOG_LEVEL, json_output=LOG_FORMAT_JSON)
+    validate_settings()
+    await ensure_indexes(get_db(), ["knowledge_graph"])
+    await _seed_default_knowledge_graph()
+    logger.info("Generator service ready")
+    yield
+    await close_client()
+    logger.info("Generator service stopped")
+
 
 app = FastAPI(
+    lifespan=lifespan,
     title="Testcase Generator Service",
     version="1.0.0",
     description="""AI-powered test case and automation generation service using Ollama LLM.
@@ -170,17 +423,395 @@ async def _execute_script_with_retries(client: httpx.AsyncClient, script: str, v
             raise last_exc
 
 
+async def _ollama_generate_request(client: httpx.AsyncClient, prompt: str, extra: dict | None = None, timeout: int = 90) -> dict:
+    """Helper that calls the Ollama generate endpoint with deterministic params from env.
+
+    Returns the parsed JSON body from Ollama or raises the underlying httpx exception.
+    """
+    payload = {
+        "model": OLLAMA_MODEL,
+        "prompt": prompt,
+        "stream": False,
+        "temperature": float(OLLAMA_TEMPERATURE),
+        "top_p": float(OLLAMA_TOP_P),
+        "max_tokens": int(OLLAMA_MAX_TOKENS),
+    }
+    if extra:
+        payload.update(extra)
+
+    resp = await client.post(f"{OLLAMA_URL}/api/generate", json=payload, timeout=timeout)
+    resp.raise_for_status()
+    return resp.json()
+
+
+async def _repair_and_rerun(
+    client: httpx.AsyncClient,
+    original_script: str,
+    video_filename_base: str,
+    *,
+    test_case_id: str | None = None,
+    exec_error: str | None = None,
+    actions_taken: str | None = None,
+    context_text: str = "",
+    max_retries: int = 2,
+    kg: dict | None = None,
+) -> tuple[str, dict | None, int]:
+    """Attempt to repair a failing Playwright script by calling the LLM with the error log.
+
+    Returns: (final_script, exec_data_or_none, attempts_made)
+    """
+    last_exec: dict | None = None
+    current_script = original_script or ""
+
+    # Build knowledge-graph block once (uses the script itself to guess relevant pages)
+    kg_block = _build_knowledge_graph_prompt_block(current_script, kg=kg)
+
+    for attempt in range(1, max_retries + 1):
+        prompt = (
+            "You are an expert Playwright automation engineer. A script was executed and failed. "
+            "Return ONLY the corrected JavaScript code (no markdown, no fences, no explanation). "
+            "The returned code should be the full test body to be executed inside `async (page) => { ... }` and should use `await page.*` statements.\n\n"
+            "CRITICAL RULES:\n"
+            "- Use Playwright locator APIs: page.locator(), page.getByRole(), page.getByText(), page.getByLabel().\n"
+            "- NEVER use page.evaluate() to inspect DOM elements or read className/attributes.\n"
+            "- SVG elements do NOT have a string className – never call .className.split().\n"
+            "- For reading text, use page.locator('selector').textContent() instead of page.evaluate.\n"
+            "- For verifying elements, use page.locator('selector').waitFor() or .isVisible().\n\n"
+        )
+        if kg_block:
+            prompt += (
+                "=== APP KNOWLEDGE GRAPH (routes, buttons, selectors) ===\n"
+                f"{kg_block}\n"
+                "=== END KNOWLEDGE GRAPH ===\n\n"
+            )
+        prompt += f"Original script:\n{current_script}\n\n"
+        if exec_error:
+            prompt += f"Execution error:\n{exec_error}\n\n"
+        if actions_taken:
+            prompt += f"Actions/transcript:\n{actions_taken}\n\n"
+        if context_text:
+            prompt += f"Context:\n{context_text}\n\n"
+        prompt += (
+            "Please make minimal edits necessary to fix the failure (selectors, waits, ordering). "
+            "Replace any page.evaluate() DOM reads with page.locator() equivalents. "
+            "If you cannot determine a fix, return the original script unchanged."
+        )
+
+        try:
+            data = await _ollama_generate_request(client, prompt, timeout=120)
+            text = (data.get("response") or data.get("output") or "").strip()
+            text = _strip_markdown_code_fences(text)
+            candidate = _unwrap_playwright_script_to_page_only(text)
+            if not candidate:
+                # nothing to try
+                continue
+
+            # Execute repaired candidate
+            repair_video = f"{video_filename_base}_repair{attempt}.webm"
+            try:
+                exec_data = await _execute_script_with_retries(client, candidate, repair_video, record_video=True)
+                success = bool(exec_data.get("success"))
+                last_exec = exec_data
+                current_script = candidate
+                # Also check for hidden errors in transcript
+                repair_actions = exec_data.get("actions_taken") or ""
+                repair_error = exec_data.get("error") or ""
+                hidden = _detect_hidden_errors(repair_actions, repair_error)
+                if hidden and success:
+                    success = False
+                    exec_error = hidden
+                if success:
+                    return current_script, last_exec, attempt
+                # else loop to try again
+                exec_error = exec_data.get("error") or exec_error
+                actions_taken = exec_data.get("actions_taken") or actions_taken
+            except Exception as e:
+                exec_error = str(e)
+                last_exec = {"error": exec_error}
+                # try next repair
+                continue
+        except Exception:
+            # If LLM call fails, stop early
+            break
+
+    return current_script, last_exec, max_retries
+
+
+# ---------------------------------------------------------------------------
+# Execution quality helpers
+# ---------------------------------------------------------------------------
+
+# Patterns that indicate a real error even when MCP `/execute` returns success:true
+# NOTE: We deliberately avoid bare "Error" – it matches benign console messages
+# like "[ERROR] WebSocket ..." or "ERR_CONNECTION_REFUSED" from Vite/Docker.
+_EXEC_ERROR_PATTERNS = re.compile(
+    r"(?:TypeError|ReferenceError|SyntaxError|EvalError|RangeError|URIError|"
+    r"TimeoutError|page\.evaluate|Unhandled\s+rejection|Cannot\s+read\s+propert|"
+    r"is\s+not\s+a\s+function|is\s+not\s+defined|ActionError|"
+    r"FAIL(?:ED)?[:\s]|CRASH|Execution\s+error|Script\s+error)",
+    re.IGNORECASE,
+)
+
+# Console noise that should NOT trigger the repair loop
+_BENIGN_PATTERNS = re.compile(
+    r"(?:WebSocket\s+connection|ERR_CONNECTION_REFUSED|failed\s+to\s+connect\s+to\s+websocket|"
+    r"vite.*?client|React\s+DevTools|Download\s+the\s+React|net::ERR_|"
+    r"favicon\.ico|HMR|hot\s+module|localhost:\d+/\@vite)",
+    re.IGNORECASE,
+)
+
+
+def _detect_hidden_errors(actions_taken: str | None, exec_error: str | None) -> str | None:
+    """Scan execution transcript for error patterns missed by the boolean *success* flag.
+
+    Returns the first matching error snippet (or *None* when the output looks clean).
+    Filters out known benign console messages from Vite, Docker networking, and dev tools.
+    """
+    for text in (actions_taken, exec_error):
+        if not text:
+            continue
+        for m in _EXEC_ERROR_PATTERNS.finditer(text):
+            # Extract context around the match
+            start = max(0, m.start() - 120)
+            end = min(len(text), m.end() + 200)
+            snippet = text[start:end].strip()
+            # Skip if the surrounding context is a known benign pattern
+            if _BENIGN_PATTERNS.search(snippet):
+                continue
+            return snippet
+    # Detect silent navigation failure: page remained on about:blank
+    if actions_taken and "Page URL: about:blank" in actions_taken:
+        return "Navigation appears to have failed – page is still at about:blank"
+    return None
+
+
+async def _get_page_snapshot(client: httpx.AsyncClient) -> str | None:
+    """Ask the Playwright MCP for a DOM accessibility snapshot of the current page.
+
+    Uses a lightweight script that returns the page title + URL + visible text
+    via the `/execute` endpoint — much faster than spinning up the full agentic
+    ollama-mcp-agent /run loop.  Returns the snapshot text or *None* on failure.
+    """
+    # Fast path: run a small script that harvests key selectors from the live page.
+    # This avoids the 15-30s agentic loop from before.
+    snapshot_script = """
+// Gather accessible element info for selector guidance.
+const title = document.title || '';
+const url = location.href || '';
+const buttons = [...document.querySelectorAll('button, [role="button"]')]
+  .slice(0, 30)
+  .map(b => b.textContent?.trim() || b.getAttribute('aria-label') || '')
+  .filter(Boolean);
+const links = [...document.querySelectorAll('a')]
+  .slice(0, 30)
+  .map(a => ({ text: a.textContent?.trim()?.substring(0, 60), href: a.getAttribute('href') || '' }))
+  .filter(l => l.text);
+const headings = [...document.querySelectorAll('h1,h2,h3,h4')]
+  .slice(0, 15)
+  .map(h => h.textContent?.trim())
+  .filter(Boolean);
+const inputs = [...document.querySelectorAll('input,textarea,select')]
+  .slice(0, 20)
+  .map(i => ({ tag: i.tagName.toLowerCase(), type: i.type||'', placeholder: i.placeholder||'', name: i.name||'', label: i.getAttribute('aria-label')||'' }));
+
+JSON.stringify({ title, url, buttons, links, headings, inputs }, null, 2);
+"""
+    try:
+        resp = await client.post(
+            f"{PLAYWRIGHT_MCP_URL}/execute",
+            json={"script": f"return await page.evaluate(() => {{{snapshot_script}}})", "record_video": False},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            # The result text is in actions_taken
+            text = data.get("actions_taken", "")
+            if text and len(text) > 30:
+                return text[:6000]
+        return None
+    except Exception:
+        return None
+
+
 # Setup standardized error handlers
 setup_all_error_handlers(app)
 
-# Enable CORS for frontend
+# Production middleware: auth, rate limiting, CORS
+setup_auth(app)
+setup_rate_limiting(app)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000"],
+    allow_origins=CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ---------------------------------------------------------------------------
+# Knowledge Graph CRUD  (MongoDB-backed)
+# ---------------------------------------------------------------------------
+
+
+class KnowledgeGraphPageCreate(BaseModel):
+    route: str
+    description: str = ""
+    key_buttons: list[str] = []
+    filters: list[str] = []
+    dialogs: list[str] = []
+    empty_state: str = ""
+    also: str | None = None
+    interactive: list[str] = []
+    sections: list[str] = []
+    form_fields: list[str] = []
+    tabs: list[str] = []
+
+
+class KnowledgeGraphNavItem(BaseModel):
+    label: str
+    route: str
+
+
+class KnowledgeGraphCreate(BaseModel):
+    app_name: str
+    framework: str = ""
+    base_url: str = "http://localhost:3000"
+    selector_strategy: str = ""
+    nav_items: list[KnowledgeGraphNavItem] = []
+    pages: list[KnowledgeGraphPageCreate] = []
+    common_button_labels: list[str] = []
+    aria_labels: list[str] = []
+    is_default: bool = False
+
+
+class KnowledgeGraphUpdate(BaseModel):
+    app_name: str | None = None
+    framework: str | None = None
+    base_url: str | None = None
+    selector_strategy: str | None = None
+    nav_items: list[KnowledgeGraphNavItem] | None = None
+    pages: list[KnowledgeGraphPageCreate] | None = None
+    common_button_labels: list[str] | None = None
+    aria_labels: list[str] | None = None
+    is_default: bool | None = None
+
+
+def _kg_doc_to_out(doc: dict) -> dict:
+    """Mongo doc → JSON-serialisable dict."""
+    doc["id"] = str(doc.pop("_id"))
+    return doc
+
+
+@app.get("/knowledge-graphs", tags=["knowledge-graph"])
+async def list_knowledge_graphs():
+    db = get_db()
+    docs = await db[KG_COLLECTION].find().sort("app_name", 1).to_list(100)
+    return [_kg_doc_to_out(d) for d in docs]
+
+
+@app.get("/knowledge-graphs/{kg_id}", tags=["knowledge-graph"])
+async def get_knowledge_graph(kg_id: str):
+    db = get_db()
+    doc = await db[KG_COLLECTION].find_one({"_id": ObjectId(kg_id)})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Knowledge graph not found")
+    return _kg_doc_to_out(doc)
+
+
+@app.post("/knowledge-graphs", tags=["knowledge-graph"], status_code=201)
+async def create_knowledge_graph(body: KnowledgeGraphCreate):
+    db = get_db()
+    now = datetime.now(timezone.utc)
+    doc = body.model_dump()
+    doc["created_at"] = now
+    doc["updated_at"] = now
+    # Convert page list to dict keyed by route for internal storage
+    doc["pages"] = {p["route"]: p for p in doc["pages"]}
+    doc["nav_items"] = [ni for ni in doc["nav_items"]]
+    result = await db[KG_COLLECTION].insert_one(doc)
+    doc["id"] = str(result.inserted_id)
+    doc.pop("_id", None)
+    return doc
+
+
+@app.put("/knowledge-graphs/{kg_id}", tags=["knowledge-graph"])
+async def update_knowledge_graph(kg_id: str, body: KnowledgeGraphUpdate):
+    db = get_db()
+    updates = {k: v for k, v in body.model_dump(exclude_none=True).items()}
+    if not updates:
+        raise HTTPException(status_code=400, detail="No fields to update")
+    # Convert page list → dict keyed by route
+    if "pages" in updates:
+        updates["pages"] = {p["route"]: p for p in updates["pages"]}
+    updates["updated_at"] = datetime.now(timezone.utc)
+    result = await db[KG_COLLECTION].update_one({"_id": ObjectId(kg_id)}, {"$set": updates})
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Knowledge graph not found")
+    doc = await db[KG_COLLECTION].find_one({"_id": ObjectId(kg_id)})
+    return _kg_doc_to_out(doc)
+
+
+@app.delete("/knowledge-graphs/{kg_id}", tags=["knowledge-graph"])
+async def delete_knowledge_graph(kg_id: str):
+    db = get_db()
+    result = await db[KG_COLLECTION].delete_one({"_id": ObjectId(kg_id)})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Knowledge graph not found")
+    return {"deleted": True}
+
+
+async def _load_knowledge_graph_for_app(app_name: str | None = None) -> dict | None:
+    """Load a knowledge graph from MongoDB.
+
+    If *app_name* is given, look for an exact match. Otherwise return the
+    document marked ``is_default=True``, or the first available document.
+    Falls back to the hardcoded ``APP_KNOWLEDGE_GRAPH`` if nothing is in the DB.
+    """
+    db = get_db()
+    coll = db[KG_COLLECTION]
+    doc = None
+    if app_name:
+        doc = await coll.find_one({"app_name": {"$regex": f"^{re.escape(app_name)}$", "$options": "i"}})
+    if not doc:
+        doc = await coll.find_one({"is_default": True})
+    if not doc:
+        doc = await coll.find_one()  # any
+    if doc:
+        return _kg_doc_to_dict(doc)
+    return None
+
+
+def _kg_doc_to_dict(doc: dict) -> dict:
+    """Convert a MongoDB knowledge graph document into the dict format
+    expected by ``_build_knowledge_graph_prompt_block``."""
+    pages_raw = doc.get("pages", {})
+    pages: dict = {}
+    if isinstance(pages_raw, dict):
+        pages = pages_raw
+    elif isinstance(pages_raw, list):
+        for p in pages_raw:
+            route = p.get("route", "")
+            if route:
+                pages[route] = p
+    nav_raw = doc.get("nav_items", [])
+    nav_items = []
+    for ni in nav_raw:
+        if isinstance(ni, dict) and ni.get("label") and ni.get("route"):
+            nav_items.append(ni)
+    return {
+        "app_name": doc.get("app_name", "Unknown"),
+        "framework": doc.get("framework", ""),
+        "base_url_docker": doc.get("base_url", "http://localhost:3000"),
+        "selector_strategy": doc.get("selector_strategy", ""),
+        "layout": {
+            "sidebar": {
+                "nav_items": nav_items,
+            },
+        },
+        "pages": pages,
+        "common_button_labels": doc.get("common_button_labels", []),
+        "aria_labels": doc.get("aria_labels", []),
+    }
 
 
 @app.post("/execute-script-debug")
@@ -439,9 +1070,9 @@ async def _build_llm_execution_context(client: httpx.AsyncClient, test_case: dic
     """Build a context block for the LLM and a structured metadata payload.
 
     Includes:
-    - Test case title/description/preconditions
-    - Linked requirements (full objects) when ids are available
-    - Linked releases (full objects) when ids are available
+    - Test case full fields (title, gherkin, description, preconditions, status)
+    - Linked requirements (all fields) when ids are available
+    - Linked releases (all fields) when ids are available
     """
     metadata = test_case.get("metadata") or {}
 
@@ -492,18 +1123,70 @@ async def _build_llm_execution_context(client: httpx.AsyncClient, test_case: dic
         if rel_obj:
             releases_full.append(rel_obj)
 
+    # -- Build readable context text for the LLM ----------------------------
     ctx_lines: list[str] = []
-    if requirements_full:
-        ctx_lines.append("Linked Requirements (full):")
-        ctx_lines.append(str(requirements_full))
-    else:
-        ctx_lines.append("Linked Requirements (full): none")
 
-    if releases_full:
-        ctx_lines.append("Linked Releases (full):")
-        ctx_lines.append(str(releases_full))
+    # Full test case fields
+    tc_title = test_case.get("title", "")
+    tc_gherkin = test_case.get("gherkin", "")
+    tc_status = test_case.get("status", "")
+    tc_desc = metadata.get("description", "")
+    tc_pre = metadata.get("preconditions", "")
+    tc_steps = metadata.get("steps", [])
+    ctx_lines.append("=== TEST CASE (full) ===")
+    ctx_lines.append(f"Title: {tc_title}")
+    if tc_desc:
+        ctx_lines.append(f"Description: {tc_desc}")
+    if tc_pre:
+        ctx_lines.append(f"Preconditions: {tc_pre}")
+    ctx_lines.append(f"Status: {tc_status}")
+    if tc_gherkin:
+        ctx_lines.append(f"Gherkin/BDD Scenario:\n{tc_gherkin}")
+    if tc_steps:
+        ctx_lines.append("Steps:")
+        for i, st in enumerate(tc_steps, 1):
+            if isinstance(st, dict):
+                ctx_lines.append(f"  {i}. Action: {st.get('action', '')}")
+                exp = st.get("expected_result", "")
+                if exp:
+                    ctx_lines.append(f"     Expected: {exp}")
+            else:
+                ctx_lines.append(f"  {i}. {st}")
+    ctx_lines.append("")
+
+    # Linked requirements (all fields)
+    if requirements_full:
+        ctx_lines.append("=== LINKED REQUIREMENTS ===")
+        for req in requirements_full:
+            ctx_lines.append(f"Requirement: {req.get('title', 'N/A')} (id: {req.get('id', '')})")
+            if req.get("description"):
+                ctx_lines.append(f"  Description: {req['description']}")
+            if req.get("source"):
+                ctx_lines.append(f"  Source: {req['source']}")
+            if req.get("tags"):
+                ctx_lines.append(f"  Tags: {', '.join(req['tags'])}")
+            if req.get("release_id"):
+                ctx_lines.append(f"  Release ID: {req['release_id']}")
+            ctx_lines.append("")
     else:
-        ctx_lines.append("Linked Releases (full): none")
+        ctx_lines.append("Linked Requirements: none")
+        ctx_lines.append("")
+
+    # Linked releases (all fields)
+    if releases_full:
+        ctx_lines.append("=== LINKED RELEASES ===")
+        for rel in releases_full:
+            ctx_lines.append(f"Release: {rel.get('name', 'N/A')} (id: {rel.get('id', '')})")
+            if rel.get("description"):
+                ctx_lines.append(f"  Description: {rel['description']}")
+            if rel.get("from_date"):
+                ctx_lines.append(f"  From: {rel['from_date']}")
+            if rel.get("to_date"):
+                ctx_lines.append(f"  To: {rel['to_date']}")
+            ctx_lines.append("")
+    else:
+        ctx_lines.append("Linked Releases: none")
+        ctx_lines.append("")
 
     ctx_text = "\n".join(ctx_lines)
     ctx_meta = {
@@ -677,7 +1360,7 @@ async def generate_structured_testcase_with_ollama(
     client: httpx.AsyncClient,
     requirement_title: str,
     requirement_desc: str | None,
-) -> tuple[StructuredTestcase | None, int]:
+) -> tuple[StructuredTestcase | None, int, str | None]:
     schema_hint = (
         '{"title":"...","description":"...","priority":"critical|high|medium|low","steps":[{"action":"...","expected_result":"..."}]}'
     )
@@ -704,31 +1387,19 @@ async def generate_structured_testcase_with_ollama(
             )
 
         try:
-            resp = await client.post(
-                f"{OLLAMA_URL}/api/generate",
-                json={
-                    "model": OLLAMA_MODEL,
-                    "prompt": prompt,
-                    "stream": False,
-                    # Best-effort: Ollama supports JSON mode. If unsupported, it is ignored.
-                    "format": "json",
-                },
-                timeout=90,
-            )
-            resp.raise_for_status()
-            data = resp.json()
+            data = await _ollama_generate_request(client, prompt, timeout=90)
             text = (data.get("response") or data.get("output") or "").strip()
             text = _strip_markdown_code_fences(text)
             json_text = _extract_first_json_object(text) or text
             parsed = json.loads(json_text)
             tc = StructuredTestcase.model_validate(parsed)
-            return tc, attempt
+            return tc, attempt, None
         except (json.JSONDecodeError, ValidationError) as e:
             last_error = str(e)
         except Exception as e:
             last_error = str(e)
 
-    return None, 3
+    return None, 3, last_error
 
 
 def _fallback_test_suite(requirement_title: str, requirement_desc: str | None) -> tuple[list[SuiteTestcase], list[SuiteTestcase]]:
@@ -800,7 +1471,7 @@ async def generate_test_suite_with_ollama(
     requirement_desc: str | None,
     positive_amount: int,
     negative_amount: int,
-) -> tuple[GenerateTestSuiteResponse | None, int]:
+) -> tuple[GenerateTestSuiteResponse | None, int, str | None]:
     schema_hint = (
         '{"positive_tests":[{"title":"...","description":"...","priority":"critical|high|medium|low","steps":[{"action":"...","expected_result":"..."}],"test_type":"manual"}],'
         '"negative_tests":[{"title":"...","description":"...","priority":"critical|high|medium|low","steps":[{"action":"...","expected_result":"..."}],"test_type":"manual"}]}'
@@ -829,18 +1500,7 @@ async def generate_test_suite_with_ollama(
             )
 
         try:
-            resp = await client.post(
-                f"{OLLAMA_URL}/api/generate",
-                json={
-                    "model": OLLAMA_MODEL,
-                    "prompt": prompt,
-                    "stream": False,
-                    "format": "json",
-                },
-                timeout=120,
-            )
-            resp.raise_for_status()
-            data = resp.json()
+            data = await _ollama_generate_request(client, prompt, timeout=120)
             text = (data.get("response") or data.get("output") or "").strip()
             text = _strip_markdown_code_fences(text)
             json_text = _extract_first_json_object(text) or text
@@ -879,13 +1539,13 @@ async def generate_test_suite_with_ollama(
                     ],
                 )
 
-            return resp_model, attempt
+            return resp_model, attempt, None
         except (json.JSONDecodeError, ValidationError) as e:
             last_error = str(e)
         except Exception as e:
             last_error = str(e)
 
-    return None, 3
+    return None, 3, last_error
 
 
 async def generate_with_ollama(client: httpx.AsyncClient, requirement_title: str, requirement_desc: str | None, idx: int) -> str | None:
@@ -896,19 +1556,8 @@ async def generate_with_ollama(client: httpx.AsyncClient, requirement_title: str
         f"Scenario index: {idx}\n"
     )
     try:
-        resp = await client.post(
-            f"{OLLAMA_URL}/api/generate",
-            json={
-                "model": OLLAMA_MODEL,
-                "prompt": prompt,
-                "stream": False,
-            },
-            timeout=60,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        text = data.get("response") or data.get("output") or ""
-        text = text.strip()
+        data = await _ollama_generate_request(client, prompt, timeout=60)
+        text = (data.get("response") or data.get("output") or "").strip()
         return text or None
     except Exception:
         return None
@@ -935,20 +1584,9 @@ async def generate_automation_with_ollama(client: httpx.AsyncClient, test_case_t
         "if (title !== 'Expected Title') throw new Error('Title mismatch');\n"
     )
     try:
-        resp = await client.post(
-            f"{OLLAMA_URL}/api/generate",
-            json={
-                "model": OLLAMA_MODEL,
-                "prompt": prompt,
-                "stream": False,
-            },
-            timeout=120,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        text = data.get("response") or data.get("output") or ""
-        text = text.strip()
-        
+        data = await _ollama_generate_request(client, prompt, timeout=120)
+        text = (data.get("response") or data.get("output") or "").strip()
+
         # Remove markdown code blocks if present
         if text.startswith("```"):
             lines = text.split('\n')
@@ -958,7 +1596,7 @@ async def generate_automation_with_ollama(client: httpx.AsyncClient, test_case_t
             if lines and lines[-1].strip() == "```":
                 lines = lines[:-1]
             text = '\n'.join(lines).strip()
-        
+
         return text or None
     except Exception:
         return None
@@ -999,8 +1637,29 @@ def _unwrap_playwright_script_to_page_only(script: str) -> str:
             text = (m.group(1) or "").strip()
             continue
 
+        # IIFE: (async (page) => { ... })(page)
         m = re.search(
             r"async\s*\(\s*page\s*\)\s*=>\s*\{([\s\S]*?)\}\s*\)\s*\(\s*page\s*\)",
+            text,
+            re.IGNORECASE,
+        )
+        if m:
+            text = (m.group(1) or "").strip()
+            continue
+
+        # Non-IIFE arrow function: async (page) => { ... }  (no invocation)
+        m = re.match(
+            r"^\s*(?:const\s+\w+\s*=\s*)?async\s*\(\s*page\s*\)\s*=>\s*\{([\s\S]*)\}\s*;?\s*$",
+            text,
+            re.IGNORECASE,
+        )
+        if m:
+            text = (m.group(1) or "").strip()
+            continue
+
+        # async function(page) { ... }  (no invocation)
+        m = re.match(
+            r"^\s*async\s+function\s*\(\s*page\s*\)\s*\{([\s\S]*)\}\s*;?\s*$",
             text,
             re.IGNORECASE,
         )
@@ -1018,6 +1677,79 @@ def _unwrap_playwright_script_to_page_only(script: str) -> str:
     return text.strip()
 
 
+async def _generate_playwright_script_single_call(
+    client: httpx.AsyncClient,
+    test_case_title: str,
+    description: str,
+    preconditions: str,
+    steps,
+    base_url_hint: str,
+    context_text: str = "",
+    kg: dict | None = None,
+    gherkin: str = "",
+) -> str | None:
+    """Fast path: generate the entire Playwright script in a single LLM call.
+
+    Uses the app knowledge graph so the LLM already knows every page's buttons,
+    selectors, and routes — no live DOM snapshot needed.
+
+    Returns the script string or *None* if the output looks broken.
+    """
+    steps_text = format_steps_for_mcp(steps)
+    kg_block = _build_knowledge_graph_prompt_block(steps_text, kg=kg)
+
+    prompt = "".join([
+        "You are an expert Playwright automation engineer.\n",
+        "Generate a COMPLETE Playwright script for ALL of the test steps below in ONE output.\n",
+        "Output ONLY JavaScript code (no markdown, no code fences, no explanations).\n",
+        "The code will be inserted inside `async (page) => { ... }` and executed via Playwright MCP.\n",
+        "Only `page` is guaranteed to exist. Do NOT reference `context` or `browser`.\n",
+        "Do NOT wrap your code in any function/IIFE.\n\n",
+        "CRITICAL RULES:\n",
+        "- Use page.getByRole(), page.getByText(), page.getByLabel(), page.locator() — NEVER page.evaluate().\n",
+        "- SVG elements have no string className.\n",
+        "- For navigation: await page.goto(url); await page.waitForLoadState('networkidle');\n",
+        "- For clicks: await page.getByRole('button', {name:'Label'}).click();\n",
+        "- For links: await page.getByRole('link', {name:'Label'}).click();\n",
+        "- Add await page.waitForTimeout(500); after interactions that trigger navigation.\n",
+        "- Prefer .first() when a selector may match multiple elements.\n\n",
+        f"Docker base URL: {base_url_hint}\n",
+        "Replace any localhost/127.0.0.1/0.0.0.0 URLs with the Docker base URL.\n\n",
+        "=== APPLICATION KNOWLEDGE GRAPH ===\n",
+        kg_block, "\n",
+        "=== END KNOWLEDGE GRAPH ===\n\n",
+        f"Test Case: {test_case_title}\n",
+        f"Description: {description or 'N/A'}\n",
+        f"Preconditions: {preconditions or 'N/A'}\n",
+    ])
+    if gherkin:
+        prompt += f"\nGherkin/BDD Scenario:\n{gherkin}\n"
+    prompt += "\n"
+    if context_text:
+        prompt += f"Additional context:\n{context_text[:2000]}\n\n"
+    prompt += f"Steps to implement:\n{steps_text}\n\n"
+    prompt += "Generate the COMPLETE script now."
+
+    try:
+        data = await _ollama_generate_request(client, prompt, timeout=120)
+        text = (data.get("response") or data.get("output") or "").strip()
+        text = _strip_markdown_code_fences(text)
+        if not text or len(text) < 20:
+            return None
+        text = _unwrap_playwright_script_to_page_only(text)
+        try:
+            text = _URL_RE.sub(lambda m: rewrite_localhost_url(m.group(1)), text)
+        except Exception:
+            pass
+        try:
+            text = _rewrite_localhost_in_text(text)
+        except Exception:
+            pass
+        return text.strip() or None
+    except Exception:
+        return None
+
+
 async def generate_playwright_script_step_by_step_with_ollama(
     client: httpx.AsyncClient,
     test_case_title: str,
@@ -1026,8 +1758,16 @@ async def generate_playwright_script_step_by_step_with_ollama(
     steps,
     base_url_hint: str,
     context_text: str = "",
+    kg: dict | None = None,
+    gherkin: str = "",
 ) -> tuple[str | None, str]:
-    """Generate a Playwright script by iterating steps.
+    """Generate a Playwright script — fast single-call first, step-by-step fallback.
+
+    1. **Fast path** (single LLM call with knowledge graph): ~10-15s
+       Generates the complete script in one shot using the app knowledge graph
+       for selector/route awareness. Used for most cases.
+    2. **Step-by-step fallback**: Only used if fast path returns nothing.
+       Iterates steps one-by-one with optional live DOM snapshots.
 
     Returns: (final_script_or_none, generation_log)
     """
@@ -1042,12 +1782,29 @@ async def generate_playwright_script_step_by_step_with_ollama(
     else:
         steps_list = [steps]
 
-    current_script = ""
     log_lines: list[str] = []
+
+    # ---- Fast path: single-call generation ----
+    fast_script = await _generate_playwright_script_single_call(
+        client, test_case_title, description, preconditions,
+        steps, base_url_hint, context_text, kg=kg, gherkin=gherkin,
+    )
+    if fast_script:
+        log_lines.append("Fast-path (single-call + knowledge graph): OK")
+        return fast_script, "\n".join(log_lines)
+
+    log_lines.append("Fast-path: failed, falling back to step-by-step")
+
+    # ---- Step-by-step fallback ----
+    current_script = ""
 
     context_text = (context_text or "").strip()
     if len(context_text) > 4000:
         context_text = context_text[:4000].rstrip() + "\n\n[Context truncated]"
+
+    # Precompute the knowledge graph block once (scoped to the steps)
+    steps_text_for_kg = format_steps_for_mcp(steps)
+    kg_block = _build_knowledge_graph_prompt_block(steps_text_for_kg, kg=kg)
 
     for idx, step in enumerate(steps_list, start=1):
         action, expected = _format_step_for_llm(step, idx)
@@ -1061,20 +1818,44 @@ async def generate_playwright_script_step_by_step_with_ollama(
                 f"{context_text}\n\n"
             )
 
+        # ---- Live DOM snapshot (lightweight, ~2s) ----
+        dom_snapshot_block = ""
+        if idx > 1 and current_script:
+            try:
+                snapshot = await _get_page_snapshot(client)
+                if snapshot:
+                    snap = snapshot[:3000]
+                    dom_snapshot_block = (
+                        "Live page element inventory (buttons, links, headings, inputs on current page):\n"
+                        f"```\n{snap}\n```\n\n"
+                    )
+            except Exception:
+                pass  # snapshot is optional
+
         prompt = "".join(
             [
                 "You are an expert Playwright automation engineer. ",
                 "We are building ONE Playwright script incrementally, one manual step at a time.\n\n",
                 "Output ONLY JavaScript code (no markdown, no code fences, no explanations).\n",
-                "IMPORTANT execution detail: your returned code will be inserted inside `async (page) => { ... }` and executed via Playwright MCP.\n",
+                "The code will be inserted inside `async (page) => { ... }` and executed via Playwright MCP.\n",
                 "Only `page` is guaranteed to exist. Do NOT reference `context` or `browser`.\n",
-                "Do NOT wrap your code in any function/IIFE; return only the statements that belong inside the function body.\n\n",
-                f"Execution environment note: navigation base URL inside Docker is {base_url_hint}. ",
-                "If a step mentions localhost/127.0.0.1/0.0.0.0, treat it as that base URL.\n\n",
+                "Do NOT wrap your code in any function/IIFE.\n\n",
+                "CRITICAL RULES:\n",
+                "- Use page.getByRole(), page.getByText(), page.getByLabel(), page.locator() — NEVER page.evaluate().\n",
+                "- SVG elements have no string className.\n",
+                "- Prefer .first() when a selector may match multiple elements.\n",
+                "- Add short waits after navigation: await page.waitForLoadState('networkidle');\n\n",
+                f"Docker base URL: {base_url_hint}\n",
+                "Replace any localhost/127.0.0.1 URLs with the Docker base URL.\n\n",
+                "=== APP KNOWLEDGE GRAPH (routes, buttons, selectors) ===\n",
+                kg_block, "\n",
+                "=== END KNOWLEDGE GRAPH ===\n\n",
                 f"Test Case: {test_case_title}\n",
                 f"Description: {description or 'N/A'}\n",
-                f"Preconditions: {preconditions or 'N/A'}\n\n",
+                f"Preconditions: {preconditions or 'N/A'}\n",
+                f"Gherkin/BDD Scenario: {gherkin or 'N/A'}\n\n",
                 context_block,
+                dom_snapshot_block,
                 "Current script so far (you MUST keep and extend it):\n",
                 f"{current_script}\n\n",
                 f"Now implement Step {idx}: {action}\n",
@@ -1084,17 +1865,7 @@ async def generate_playwright_script_step_by_step_with_ollama(
         )
 
         try:
-            resp = await client.post(
-                f"{OLLAMA_URL}/api/generate",
-                json={
-                    "model": OLLAMA_MODEL,
-                    "prompt": prompt,
-                    "stream": False,
-                },
-                timeout=120,
-            )
-            resp.raise_for_status()
-            data = resp.json()
+            data = await _ollama_generate_request(client, prompt, timeout=120)
             text = (data.get("response") or data.get("output") or "").strip()
             text = _strip_markdown_code_fences(text)
             if not text:
@@ -1103,7 +1874,6 @@ async def generate_playwright_script_step_by_step_with_ollama(
 
             text = _unwrap_playwright_script_to_page_only(text)
 
-            # Rewrite any localhost-y URLs in the generated code.
             try:
                 text = _URL_RE.sub(lambda m: rewrite_localhost_url(m.group(1)), text)
             except Exception:
@@ -1143,8 +1913,8 @@ async def health():
     }
 
 @app.post("/generate", response_model=GenerateResult)
-async def generate(payload: GenerateRequest):
-    async with httpx.AsyncClient(timeout=20) as client:
+async def generate(payload: GenerateRequest, request: Request):
+    async with httpx.AsyncClient(timeout=20, headers=_fwd_headers(request)) as client:
         # 1) fetch requirement
         r = await client.get(f"{REQ_URL}/requirements/{payload.requirement_id}")
         if r.status_code == 404:
@@ -1184,25 +1954,26 @@ async def generate(payload: GenerateRequest):
 
 
 @app.post("/generate-structured-testcase", response_model=GenerateStructuredResponse)
-async def generate_structured_testcase(payload: GenerateStructuredRequest):
+async def generate_structured_testcase(payload: GenerateStructuredRequest, request: Request):
     """Generate a single structured testcase for a requirement.
 
     Note: This endpoint does NOT persist the testcase; it only returns a validated JSON structure.
     """
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with httpx.AsyncClient(timeout=30, headers=_fwd_headers(request)) as client:
         r = await client.get(f"{REQ_URL}/requirements/{payload.requirement_id}")
         if r.status_code == 404:
             raise HTTPException(status_code=404, detail="Requirement not found")
         r.raise_for_status()
         req = r.json()
 
-        tc, attempts = await generate_structured_testcase_with_ollama(
+        tc, attempts, last_error = await generate_structured_testcase_with_ollama(
             client,
             requirement_title=req.get("title") or "Requirement",
             requirement_desc=req.get("description"),
         )
         if tc is None:
-            tc = _fallback_structured_testcase(req.get("title") or "Requirement", req.get("description"))
+            # Fail fast: invalid LLM output (unable to produce a validated testcase)
+            raise HTTPException(status_code=502, detail={"msg": "LLM output failed validation", "error": last_error})
 
         return {
             "testcase": tc,
@@ -1213,19 +1984,19 @@ async def generate_structured_testcase(payload: GenerateStructuredRequest):
 
 
 @app.post("/generate-test-suite", response_model=GenerateTestSuiteResponse)
-async def generate_test_suite(payload: GenerateTestSuiteRequest):
+async def generate_test_suite(payload: GenerateTestSuiteRequest, request: Request):
     """Generate a structured test suite (positive + negative tests) for review.
 
     Note: This endpoint does NOT persist testcases.
     """
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with httpx.AsyncClient(timeout=30, headers=_fwd_headers(request)) as client:
         r = await client.get(f"{REQ_URL}/requirements/{payload.requirement_id}")
         if r.status_code == 404:
             raise HTTPException(status_code=404, detail="Requirement not found")
         r.raise_for_status()
         req = r.json()
 
-        suite, attempts = await generate_test_suite_with_ollama(
+        suite, attempts, last_error = await generate_test_suite_with_ollama(
             client,
             requirement_title=req.get("title") or "Requirement",
             requirement_desc=req.get("description"),
@@ -1234,47 +2005,15 @@ async def generate_test_suite(payload: GenerateTestSuiteRequest):
         )
 
         if suite is None:
-            pos, neg = _fallback_test_suite(req.get("title") or "Requirement", req.get("description"))
-            # Ensure we satisfy requested minimums
-            if len(pos) < payload.positive_amount or len(neg) < payload.negative_amount:
-                # Expand by duplicating the last element with slight title tweaks (rare fallback edge)
-                while len(pos) < payload.positive_amount:
-                    base = pos[-1]
-                    pos.append(
-                        SuiteTestcase(
-                            title=f"{base.title} (alt {len(pos)+1})",
-                            description=base.description,
-                            priority=base.priority,
-                            steps=base.steps,
-                            test_type=base.test_type,
-                        )
-                    )
-                while len(neg) < payload.negative_amount:
-                    base = neg[-1]
-                    neg.append(
-                        SuiteTestcase(
-                            title=f"{base.title} (alt {len(neg)+1})",
-                            description=base.description,
-                            priority=base.priority,
-                            steps=base.steps,
-                            test_type=base.test_type,
-                        )
-                    )
-
-            return {
-                "positive_tests": pos[: payload.positive_amount],
-                "negative_tests": neg[: payload.negative_amount],
-                "generator": "ollama",
-                "model": OLLAMA_MODEL,
-                "attempts": attempts,
-            }
+            # Reject invalid LLM outputs so callers can handle/inspect the failure
+            raise HTTPException(status_code=502, detail={"msg": "LLM output failed validation", "error": last_error})
 
         return suite.model_dump()
 
 @app.post("/generate-automation-from-execution", response_model=ExecutionAutomationOut)
-async def generate_automation_from_execution(payload: ExecutionGenerateRequest):
+async def generate_automation_from_execution(payload: ExecutionGenerateRequest, request: Request):
     """Default: generate a script step-by-step (LLM), execute it, then persist the automation."""
-    async with httpx.AsyncClient(timeout=300) as client:
+    async with httpx.AsyncClient(timeout=300, headers=_fwd_headers(request)) as client:
         tc_resp = await client.get(f"{TC_URL}/testcases/{payload.test_case_id}")
         if tc_resp.status_code == 404:
             raise HTTPException(status_code=404, detail="Test case not found")
@@ -1287,12 +2026,17 @@ async def generate_automation_from_execution(payload: ExecutionGenerateRequest):
         test_case = tc_resp.json()
 
         title = test_case.get("title", "Automation from Execution")
+        gherkin = test_case.get("gherkin", "")
         metadata = test_case.get("metadata", {})
         description = metadata.get("description", "")
         preconditions = metadata.get("preconditions", "")
         steps = metadata.get("steps", [])
 
         context_text, context_meta = await _build_llm_execution_context(client, test_case)
+
+        # Load knowledge graph from DB (falls back to hardcoded default)
+        kg = await _load_knowledge_graph_for_app()
+
         script_outline, generation_log = await generate_playwright_script_step_by_step_with_ollama(
             client,
             test_case_title=title,
@@ -1301,6 +2045,8 @@ async def generate_automation_from_execution(payload: ExecutionGenerateRequest):
             steps=steps,
             base_url_hint=INTERNAL_FRONTEND_BASE_URL,
             context_text=context_text,
+            kg=kg,
+            gherkin=gherkin,
         )
         if not script_outline:
             script_outline = build_fallback_script_from_steps(steps)
@@ -1320,6 +2066,48 @@ async def generate_automation_from_execution(payload: ExecutionGenerateRequest):
         except Exception as e:
             exec_error = str(e)
 
+        # Detect hidden errors in transcript even when MCP reports success
+        hidden = _detect_hidden_errors(actions_taken, exec_error)
+        if hidden and exec_success:
+            exec_success = False
+            exec_error = exec_error or hidden
+
+        # If execution failed, try automatic repair attempts
+        repair_attempts = 0
+        repair_exec_data = None
+        if not exec_success:
+            try:
+                repaired_script, repair_exec_data, repair_attempts = await _repair_and_rerun(
+                    client,
+                    script_outline,
+                    video_filename,
+                    test_case_id=payload.test_case_id,
+                    exec_error=exec_error,
+                    actions_taken=actions_taken,
+                    context_text=context_text,
+                    max_retries=2,
+                    kg=kg,
+                )
+                if repair_exec_data:
+                    exec_success = bool(repair_exec_data.get("success"))
+                    actions_taken = repair_exec_data.get("actions_taken") or actions_taken
+                    exec_error = repair_exec_data.get("error")
+                    video_saved = bool(repair_exec_data.get("video_saved"))
+                    # Re-check for hidden errors in repair output
+                    repair_hidden = _detect_hidden_errors(actions_taken, exec_error)
+                    if repair_hidden and exec_success:
+                        exec_success = False
+                        exec_error = exec_error or repair_hidden
+                    # adopt repaired script for persistence if it succeeded
+                    if exec_success:
+                        script_outline = repaired_script
+                # annotate generation metadata with repair results
+                generation_metadata["repair_attempts"] = repair_attempts
+                generation_metadata["repair_exec_data"] = repair_exec_data or {}
+            except Exception:
+                # swallow repair errors; keep original exec_error
+                pass
+
         if exec_success:
             automation_status = "not_started"
             generation_note = f"Generated step-by-step via LLM and executed on {now_iso()}."
@@ -1332,6 +2120,8 @@ async def generate_automation_from_execution(payload: ExecutionGenerateRequest):
                 "generation_mode": "step_by_step",
                 "step_by_step_log": generation_log,
                 "context": context_meta,
+                "repair_attempts": repair_attempts,
+                "repair_exec_data": repair_exec_data or {},
             }
         else:
             automation_status = "blocked"
@@ -1348,6 +2138,8 @@ async def generate_automation_from_execution(payload: ExecutionGenerateRequest):
                 "generation_error": exec_error or "Execution failed",
                 "step_by_step_log": generation_log,
                 "context": context_meta,
+                "repair_attempts": repair_attempts,
+                "repair_exec_data": repair_exec_data or {},
             }
         framework = "playwright"
 
@@ -1381,9 +2173,9 @@ async def generate_automation_from_execution(payload: ExecutionGenerateRequest):
 
 
 @app.post("/generate-automation-draft-from-execution", response_model=AutomationDraftOut)
-async def generate_automation_draft_from_execution(payload: ExecutionGenerateRequest):
+async def generate_automation_draft_from_execution(payload: ExecutionGenerateRequest, request: Request):
     """Default: generate a script step-by-step (LLM), then execute it, and return a reviewable automation draft (not persisted)."""
-    async with httpx.AsyncClient(timeout=300) as client:
+    async with httpx.AsyncClient(timeout=300, headers=_fwd_headers(request)) as client:
         tc_resp = await client.get(f"{TC_URL}/testcases/{payload.test_case_id}")
         if tc_resp.status_code == 404:
             raise HTTPException(status_code=404, detail="Test case not found")
@@ -1401,7 +2193,12 @@ async def generate_automation_draft_from_execution(payload: ExecutionGenerateReq
         preconditions = metadata.get("preconditions", "")
         steps = metadata.get("steps", [])
 
+        gherkin = test_case.get("gherkin", "")
+
         context_text, context_meta = await _build_llm_execution_context(client, test_case)
+
+        # Load knowledge graph from DB (falls back to hardcoded default)
+        kg = await _load_knowledge_graph_for_app()
 
         script_outline, generation_log = await generate_playwright_script_step_by_step_with_ollama(
             client,
@@ -1411,6 +2208,8 @@ async def generate_automation_draft_from_execution(payload: ExecutionGenerateReq
             steps=steps,
             base_url_hint=INTERNAL_FRONTEND_BASE_URL,
             context_text=context_text,
+            kg=kg,
+            gherkin=gherkin,
         )
         if not script_outline:
             script_outline = build_fallback_script_from_steps(steps)
@@ -1433,6 +2232,46 @@ async def generate_automation_draft_from_execution(payload: ExecutionGenerateReq
         except Exception as e:
             exec_error = str(e)
 
+        # Detect hidden errors in transcript even when MCP reports success
+        hidden = _detect_hidden_errors(actions_taken, exec_error)
+        if hidden and exec_success:
+            exec_success = False
+            exec_error = exec_error or hidden
+
+        # Attempt automatic repair on failure
+        repair_attempts = 0
+        repair_exec_data = None
+        if not exec_success:
+            try:
+                repaired_script, repair_exec_data, repair_attempts = await _repair_and_rerun(
+                    client,
+                    script_outline,
+                    video_filename,
+                    test_case_id=payload.test_case_id,
+                    exec_error=exec_error,
+                    actions_taken=actions_taken,
+                    context_text=context_text,
+                    max_retries=2,
+                    kg=kg,
+                )
+                if repair_exec_data:
+                    exec_success = bool(repair_exec_data.get("success"))
+                    actions_taken = repair_exec_data.get("actions_taken") or actions_taken
+                    transcript_out = actions_taken
+                    exec_error = repair_exec_data.get("error")
+                    video_saved = bool(repair_exec_data.get("video_saved"))
+                    # Re-check for hidden errors in repair output
+                    repair_hidden = _detect_hidden_errors(actions_taken, exec_error)
+                    if repair_hidden and exec_success:
+                        exec_success = False
+                        exec_error = exec_error or repair_hidden
+                    if exec_success:
+                        script_outline = repaired_script
+                generation_metadata["repair_attempts"] = repair_attempts
+                generation_metadata["repair_exec_data"] = repair_exec_data or {}
+            except Exception:
+                pass
+
         notes = f"Generated step-by-step via LLM and executed on {now_iso()}."
         generation_metadata = {
             "generated_at": now_iso(),
@@ -1442,6 +2281,8 @@ async def generate_automation_draft_from_execution(payload: ExecutionGenerateReq
             "generation_mode": exec_mode,
             "step_by_step_log": generation_log,
             "context": context_meta,
+            "repair_attempts": repair_attempts,
+            "repair_exec_data": repair_exec_data or {},
         }
 
         framework = "playwright"
@@ -1467,7 +2308,7 @@ async def generate_automation_draft_from_execution(payload: ExecutionGenerateReq
 
 
 @app.post("/automation-chat", response_model=AutomationChatResponse)
-async def automation_chat(payload: AutomationChatRequest):
+async def automation_chat(payload: AutomationChatRequest, request: Request):
     """Chat endpoint to help review/adjust a generated automation draft before saving."""
     # Keep this simple and safe: we only return guidance and/or a suggested script.
     history = payload.history if isinstance(payload.history, list) else []
@@ -1519,16 +2360,10 @@ async def automation_chat(payload: AutomationChatRequest):
         last_text: str | None = None
         for _attempt in range(1, 4):
             try:
-                resp = await client.post(
-                    f"{OLLAMA_URL}/api/generate",
-                    json={
-                        "model": OLLAMA_MODEL,
-                        "prompt": prompt if not last_error else (prompt + f"\nFix your JSON. Error: {last_error}"),
-                        "stream": False,
-                    },
+                data = await _ollama_generate_request(
+                    client,
+                    prompt if not last_error else (prompt + f"\nFix your JSON. Error: {last_error}"),
                 )
-                resp.raise_for_status()
-                data = resp.json()
                 text = (data.get("response") or data.get("output") or "").strip()
                 last_text = text
                 if not text:
@@ -1682,7 +2517,7 @@ async def generate_automation(payload: AutomationGenerateRequest):
                 resp = await client.post(f"{AUTOMATIONS_URL}/automations", json=automation_data)
                 resp.raise_for_status()
             except Exception as e:
-                print(f"Failed to save automation: {e}")
+                logger.warning("Failed to save automation: %s", e)
 
         return AutomationOut(
             title=payload.title,
@@ -1693,7 +2528,7 @@ async def generate_automation(payload: AutomationGenerateRequest):
 
 
 @app.post("/push-test-to-git", tags=["generation"])
-async def push_test_to_git_endpoint(payload: GitPushRequest):
+async def push_test_to_git_endpoint(payload: GitPushRequest, request: Request):
     """
     Generate automation for a test case and push it to a Git repository as a Pull/Merge Request.
     
@@ -1731,7 +2566,7 @@ async def push_test_to_git_endpoint(payload: GitPushRequest):
     }
     ```
     """
-    async with httpx.AsyncClient(timeout=300) as client:
+    async with httpx.AsyncClient(timeout=300, headers=_fwd_headers(request)) as client:
         # 1. Fetch test case
         tc_resp = await client.get(f"{TC_URL}/testcases/{payload.test_case_id}")
         if tc_resp.status_code == 404:
@@ -1820,7 +2655,8 @@ async def push_test_to_git_endpoint(payload: GitPushRequest):
                 provider=payload.provider,
                 repo_url=payload.repo_url,
                 base_branch=payload.base_branch,
-                ssh_key_name=payload.ssh_key_name
+                ssh_key_name=payload.ssh_key_name,
+                auth_headers=_fwd_headers(request)
             )
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))

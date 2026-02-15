@@ -1,5 +1,5 @@
 from datetime import datetime, timezone, timedelta
-from fastapi import FastAPI, HTTPException, Query, UploadFile, File
+from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from contextlib import asynccontextmanager
@@ -22,6 +22,12 @@ from pathlib import Path
 import re
 
 logger = get_logger(__name__)
+
+
+def _fwd_headers(request: Request) -> dict:
+    """Extract Authorization header for service-to-service forwarding."""
+    auth = request.headers.get("authorization", "")
+    return {"Authorization": auth} if auth else {}
 
 # Constants
 VIDEOS_DIR = "/videos"  # Must match playwright-mcp mount point
@@ -359,7 +365,7 @@ async def delete_automation(automation_id: str):
         raise HTTPException(status_code=404, detail="Automation not found")
 
 @app.post("/automations/{automation_id}/execute")
-async def execute_automation(automation_id: str):
+async def execute_automation(automation_id: str, request: Request):
     """Execute automation via Playwright MCP and save video"""
     db = get_db()
     doc = await db[COL].find_one({"_id": oid(automation_id)})
@@ -375,7 +381,7 @@ async def execute_automation(automation_id: str):
     started_at = now()
     try:
         # Execute via Playwright MCP
-        async with httpx.AsyncClient(timeout=300) as client:
+        async with httpx.AsyncClient(timeout=300, headers=_fwd_headers(request)) as client:
             video_filename = f"{automation_id}_{int(now().timestamp())}.webm"
             video_path = os.path.join(VIDEOS_DIR, video_filename)
             
