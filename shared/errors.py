@@ -80,9 +80,9 @@ async def generic_exception_handler(request: Request, exc: Exception):
     Handle all uncaught exceptions with standardized format.
     """
     # Log the full exception for debugging
-    import traceback
-    print(f"Unhandled exception: {exc}")
-    print(traceback.format_exc())
+    import logging
+    _logger = logging.getLogger("shared.errors")
+    _logger.error("Unhandled exception: %s", exc, exc_info=True)
     
     return create_error_response(
         error_type=exc.__class__.__name__,

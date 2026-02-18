@@ -1,6 +1,7 @@
 import os
 import subprocess
 import tempfile
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, Optional
@@ -9,6 +10,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import httpx
 from shared.errors import setup_all_error_handlers
+from shared.settings import CORS_ORIGINS, LOG_LEVEL, LOG_FORMAT_JSON
+from shared.logging_config import setup_logging, get_logger
+from shared.auth import setup_auth
+from shared.rate_limit import setup_rate_limiting
 from validators import (
     sanitize_path,
     validate_branch_name,
@@ -38,7 +43,19 @@ api_token_store = APITokenStore(SSH_KEYS_DIR / "api-tokens")
 repo_connections_store = RepoConnectionsStore(SSH_KEYS_DIR / "repo-connections")
 llm_connections_store = LLMConnectionsStore(SSH_KEYS_DIR / "llm-connections")
 
+logger = get_logger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    setup_logging("git", level=LOG_LEVEL, json_output=LOG_FORMAT_JSON)
+    logger.info("Git service ready")
+    yield
+    logger.info("Git service stopped")
+
+
 app = FastAPI(
+    lifespan=lifespan,
     title="Git Integration Service",
     version="1.0.0",
     description="""Multi-provider Git operations service with support for GitHub, GitLab, and Azure DevOps.
@@ -86,10 +103,12 @@ app = FastAPI(
 # Setup standardized error handlers
 setup_all_error_handlers(app)
 
-# Enable CORS
+# Production middleware: auth, rate limiting, CORS
+setup_auth(app)
+setup_rate_limiting(app)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000"],
+    allow_origins=CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

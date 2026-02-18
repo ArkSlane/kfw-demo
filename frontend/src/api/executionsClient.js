@@ -1,8 +1,8 @@
-import axios from 'axios';
+import { createApiClient } from './httpClient';
 
 const API_BASE_URL = 'http://localhost:8005';
 
-const client = axios.create({ baseURL: API_BASE_URL });
+const client = createApiClient(API_BASE_URL);
 
 export const executionsAPI = {
   list: async (params = {}) => {

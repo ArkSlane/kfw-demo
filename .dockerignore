@@ -1,0 +1,41 @@
+# Version control
+.git
+.gitignore
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.egg-info
+.pytest_cache
+htmlcov
+.coverage
+
+# Node
+node_modules
+.npm
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# Environment
+.env
+.env.*
+
+# Tests
+tests/
+**/tests/
+test-results/
+playwright-report/
+
+# Documentation
+docs/
+*.md
+!README.md
+
+# Build outputs
+dist/
+build/

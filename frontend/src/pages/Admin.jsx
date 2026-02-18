@@ -15,6 +15,8 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import gitTokensAPI from "@/api/gitTokensClient";
 import gitRepoConnectionsAPI from "@/api/gitRepoConnectionsClient";
 import llmConnectionsAPI from "@/api/llmConnectionsClient";
+import knowledgeGraphAPI from "@/api/knowledgeGraphClient";
+import { useDemoSettings } from "@/lib/DemoSettingsContext";
 
 // jsconfig.json enables checkJs; cast import.meta to any for Vite env access.
 const viteEnv = /** @type {any} */ (import.meta).env;
@@ -133,6 +135,129 @@ export default function Admin() {
   const [newLlmApiKey, setNewLlmApiKey] = useState("");
   const [newLlmDefaultModel, setNewLlmDefaultModel] = useState("");
 
+  // Knowledge Graphs
+  const [knowledgeGraphs, setKnowledgeGraphs] = useState([]);
+  const [loadingKG, setLoadingKG] = useState(false);
+  const [kgDialogOpen, setKgDialogOpen] = useState(false);
+  const [editingKG, setEditingKG] = useState(null); // null = create, object = edit
+  const [kgForm, setKgForm] = useState({
+    app_name: "",
+    framework: "",
+    base_url: "http://localhost:3000",
+    selector_strategy: "",
+    nav_items: [],
+    pages: [],
+    common_button_labels: [],
+    aria_labels: [],
+    is_default: false,
+  });
+  // Temp inputs for adding items
+  const [kgNewNavLabel, setKgNewNavLabel] = useState("");
+  const [kgNewNavRoute, setKgNewNavRoute] = useState("");
+  const [kgNewPageRoute, setKgNewPageRoute] = useState("");
+  const [kgNewPageDesc, setKgNewPageDesc] = useState("");
+  const [kgNewPageButtons, setKgNewPageButtons] = useState("");
+  const [kgNewPageFilters, setKgNewPageFilters] = useState("");
+  const [kgNewPageDialogs, setKgNewPageDialogs] = useState("");
+  const [kgNewButtonLabel, setKgNewButtonLabel] = useState("");
+  const [kgNewAriaLabel, setKgNewAriaLabel] = useState("");
+
+  // Demo settings
+  const { demoBannerEnabled, setDemoBannerEnabled } = useDemoSettings();
+
+  const refreshKnowledgeGraphs = async () => {
+    setLoadingKG(true);
+    try {
+      const list = await knowledgeGraphAPI.list();
+      setKnowledgeGraphs(Array.isArray(list) ? list : []);
+    } catch (e) {
+      console.error("Failed to load knowledge graphs", e);
+      toast.error("Failed to load knowledge graphs");
+    } finally {
+      setLoadingKG(false);
+    }
+  };
+
+  const openCreateKG = () => {
+    setEditingKG(null);
+    setKgForm({
+      app_name: "",
+      framework: "",
+      base_url: "http://localhost:3000",
+      selector_strategy: "",
+      nav_items: [],
+      pages: [],
+      common_button_labels: [],
+      aria_labels: [],
+      is_default: false,
+    });
+    setKgDialogOpen(true);
+  };
+
+  const openEditKG = (kg) => {
+    setEditingKG(kg);
+    // Convert pages from {route: {...}} to array
+    let pagesArr = [];
+    if (kg.pages) {
+      if (Array.isArray(kg.pages)) {
+        pagesArr = kg.pages;
+      } else {
+        pagesArr = Object.entries(kg.pages).map(([route, info]) => ({
+          route,
+          description: info.description || "",
+          key_buttons: info.key_buttons || [],
+          filters: info.filters || [],
+          dialogs: info.dialogs || [],
+        }));
+      }
+    }
+    setKgForm({
+      app_name: kg.app_name || "",
+      framework: kg.framework || "",
+      base_url: kg.base_url || kg.base_url_docker || "http://localhost:3000",
+      selector_strategy: kg.selector_strategy || "",
+      nav_items: kg.nav_items || [],
+      pages: pagesArr,
+      common_button_labels: kg.common_button_labels || [],
+      aria_labels: kg.aria_labels || [],
+      is_default: kg.is_default || false,
+    });
+    setKgDialogOpen(true);
+  };
+
+  const saveKG = async () => {
+    if (!kgForm.app_name.trim()) {
+      toast.error("App name is required");
+      return;
+    }
+    try {
+      if (editingKG) {
+        await knowledgeGraphAPI.update(editingKG.id, kgForm);
+        toast.success("Knowledge graph updated");
+      } else {
+        await knowledgeGraphAPI.create(kgForm);
+        toast.success("Knowledge graph created");
+      }
+      setKgDialogOpen(false);
+      refreshKnowledgeGraphs();
+    } catch (e) {
+      console.error("Failed to save knowledge graph", e);
+      toast.error("Failed to save knowledge graph");
+    }
+  };
+
+  const deleteKG = async (id) => {
+    if (!confirm("Delete this knowledge graph?")) return;
+    try {
+      await knowledgeGraphAPI.delete(id);
+      toast.success("Knowledge graph deleted");
+      refreshKnowledgeGraphs();
+    } catch (e) {
+      console.error("Failed to delete knowledge graph", e);
+      toast.error("Failed to delete knowledge graph");
+    }
+  };
+
   const refreshLlmConnections = async () => {
     setLoadingLlmConnections(true);
     try {
@@ -184,6 +309,11 @@ export default function Admin() {
 
   useEffect(() => {
     refreshRepos();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    refreshKnowledgeGraphs();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -391,6 +521,8 @@ export default function Admin() {
           <TabsTrigger value="health">Service health</TabsTrigger>
           <TabsTrigger value="ai">AI inclusion</TabsTrigger>
           <TabsTrigger value="approach">Test approach</TabsTrigger>
+          <TabsTrigger value="knowledge-graphs">Knowledge Graphs</TabsTrigger>
+          <TabsTrigger value="settings">Settings</TabsTrigger>
         </TabsList>
 
         <TabsContent value="tokens">
@@ -936,6 +1068,422 @@ export default function Admin() {
               className="min-h-[260px] text-sm"
               placeholder="Describe your test approach..."
             />
+          </Card>
+        </TabsContent>
+
+        {/* ---- Knowledge Graphs Tab ---- */}
+        <TabsContent value="knowledge-graphs">
+          <Card className="p-6 space-y-6">
+            <div className="flex items-center justify-between">
+              <div className="space-y-1">
+                <div className="text-sm font-medium text-slate-900">Knowledge Graphs</div>
+                <div className="text-xs text-slate-600">
+                  Define app-specific UI maps (pages, buttons, selectors) used as LLM context during test automation generation.
+                </div>
+              </div>
+              <Button size="sm" onClick={openCreateKG}>New Knowledge Graph</Button>
+            </div>
+
+            {loadingKG ? (
+              <div className="text-xs text-slate-500">Loading…</div>
+            ) : knowledgeGraphs.length === 0 ? (
+              <div className="text-xs text-slate-500">No knowledge graphs yet. Create one to improve AI test generation for your app.</div>
+            ) : (
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>App Name</TableHead>
+                    <TableHead>Framework</TableHead>
+                    <TableHead>Base URL</TableHead>
+                    <TableHead>Pages</TableHead>
+                    <TableHead>Nav Items</TableHead>
+                    <TableHead>Default</TableHead>
+                    <TableHead className="text-right">Actions</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {knowledgeGraphs.map((kg) => {
+                    const pageCount = kg.pages
+                      ? Array.isArray(kg.pages) ? kg.pages.length : Object.keys(kg.pages).length
+                      : 0;
+                    return (
+                      <TableRow key={kg.id}>
+                        <TableCell className="font-medium">{kg.app_name}</TableCell>
+                        <TableCell className="text-xs text-slate-600">{kg.framework || "—"}</TableCell>
+                        <TableCell className="text-xs font-mono">{kg.base_url || kg.base_url_docker || "—"}</TableCell>
+                        <TableCell><Badge variant="secondary">{pageCount}</Badge></TableCell>
+                        <TableCell><Badge variant="secondary">{(kg.nav_items || []).length}</Badge></TableCell>
+                        <TableCell>{kg.is_default ? <Badge>Default</Badge> : "—"}</TableCell>
+                        <TableCell className="text-right space-x-2">
+                          <Button size="sm" variant="outline" onClick={() => openEditKG(kg)}>Edit</Button>
+                          <Button size="sm" variant="destructive" onClick={() => deleteKG(kg.id)}>Delete</Button>
+                        </TableCell>
+                      </TableRow>
+                    );
+                  })}
+                </TableBody>
+              </Table>
+            )}
+          </Card>
+
+          {/* Knowledge Graph Create/Edit Dialog */}
+          <Dialog open={kgDialogOpen} onOpenChange={setKgDialogOpen}>
+            <DialogContent className="max-w-3xl max-h-[85vh] overflow-y-auto">
+              <DialogHeader>
+                <DialogTitle>{editingKG ? "Edit Knowledge Graph" : "Create Knowledge Graph"}</DialogTitle>
+              </DialogHeader>
+
+              <div className="space-y-4">
+                {/* Basic info */}
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="space-y-1">
+                    <label className="text-xs font-medium">App Name *</label>
+                    <Input
+                      value={kgForm.app_name}
+                      onChange={(e) => setKgForm((f) => ({ ...f, app_name: e.target.value }))}
+                      placeholder="e.g. TestMaster"
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <label className="text-xs font-medium">Framework</label>
+                    <Input
+                      value={kgForm.framework}
+                      onChange={(e) => setKgForm((f) => ({ ...f, framework: e.target.value }))}
+                      placeholder="e.g. React + Vite + shadcn/ui"
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <label className="text-xs font-medium">Base URL (Docker)</label>
+                    <Input
+                      value={kgForm.base_url}
+                      onChange={(e) => setKgForm((f) => ({ ...f, base_url: e.target.value }))}
+                      placeholder="http://frontend:5173"
+                    />
+                  </div>
+                  <div className="flex items-end gap-2 pb-1">
+                    <label className="text-xs font-medium flex items-center gap-2">
+                      <input
+                        type="checkbox"
+                        checked={kgForm.is_default}
+                        onChange={(e) => setKgForm((f) => ({ ...f, is_default: e.target.checked }))}
+                      />
+                      Default knowledge graph
+                    </label>
+                  </div>
+                </div>
+
+                <div className="space-y-1">
+                  <label className="text-xs font-medium">Selector Strategy</label>
+                  <Textarea
+                    value={kgForm.selector_strategy}
+                    onChange={(e) => setKgForm((f) => ({ ...f, selector_strategy: e.target.value }))}
+                    placeholder="Describe how to select elements (e.g. use role-based selectors, no data-testid, etc.)"
+                    className="min-h-[60px] text-sm"
+                  />
+                </div>
+
+                {/* Navigation Items */}
+                <div className="space-y-2">
+                  <label className="text-xs font-medium">Navigation Items</label>
+                  <div className="flex gap-2">
+                    <Input
+                      value={kgNewNavLabel}
+                      onChange={(e) => setKgNewNavLabel(e.target.value)}
+                      placeholder="Label (e.g. Test Plan)"
+                      className="text-sm"
+                    />
+                    <Input
+                      value={kgNewNavRoute}
+                      onChange={(e) => setKgNewNavRoute(e.target.value)}
+                      placeholder="Route (e.g. /TestPlan)"
+                      className="text-sm"
+                    />
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={() => {
+                        if (kgNewNavLabel.trim() && kgNewNavRoute.trim()) {
+                          setKgForm((f) => ({
+                            ...f,
+                            nav_items: [...f.nav_items, { label: kgNewNavLabel.trim(), route: kgNewNavRoute.trim() }],
+                          }));
+                          setKgNewNavLabel("");
+                          setKgNewNavRoute("");
+                        }
+                      }}
+                    >
+                      Add
+                    </Button>
+                  </div>
+                  {kgForm.nav_items.length > 0 && (
+                    <div className="flex flex-wrap gap-1">
+                      {kgForm.nav_items.map((ni, i) => (
+                        <Badge
+                          key={i}
+                          variant="secondary"
+                          className="cursor-pointer"
+                          onClick={() =>
+                            setKgForm((f) => ({
+                              ...f,
+                              nav_items: f.nav_items.filter((_, idx) => idx !== i),
+                            }))
+                          }
+                        >
+                          {ni.label} → {ni.route} ✕
+                        </Badge>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                {/* Pages */}
+                <div className="space-y-2">
+                  <label className="text-xs font-medium">Pages</label>
+                  <div className="grid grid-cols-2 gap-2">
+                    <Input
+                      value={kgNewPageRoute}
+                      onChange={(e) => setKgNewPageRoute(e.target.value)}
+                      placeholder="Route (e.g. /TestCases)"
+                      className="text-sm"
+                    />
+                    <Input
+                      value={kgNewPageDesc}
+                      onChange={(e) => setKgNewPageDesc(e.target.value)}
+                      placeholder="Description"
+                      className="text-sm"
+                    />
+                    <Input
+                      value={kgNewPageButtons}
+                      onChange={(e) => setKgNewPageButtons(e.target.value)}
+                      placeholder="Buttons (comma-separated)"
+                      className="text-sm"
+                    />
+                    <Input
+                      value={kgNewPageFilters}
+                      onChange={(e) => setKgNewPageFilters(e.target.value)}
+                      placeholder="Filters (comma-separated)"
+                      className="text-sm"
+                    />
+                    <Input
+                      value={kgNewPageDialogs}
+                      onChange={(e) => setKgNewPageDialogs(e.target.value)}
+                      placeholder="Dialogs (comma-separated)"
+                      className="text-sm"
+                    />
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={() => {
+                        if (kgNewPageRoute.trim()) {
+                          const split = (s) => s.split(",").map((x) => x.trim()).filter(Boolean);
+                          setKgForm((f) => ({
+                            ...f,
+                            pages: [
+                              ...f.pages,
+                              {
+                                route: kgNewPageRoute.trim(),
+                                description: kgNewPageDesc.trim(),
+                                key_buttons: split(kgNewPageButtons),
+                                filters: split(kgNewPageFilters),
+                                dialogs: split(kgNewPageDialogs),
+                              },
+                            ],
+                          }));
+                          setKgNewPageRoute("");
+                          setKgNewPageDesc("");
+                          setKgNewPageButtons("");
+                          setKgNewPageFilters("");
+                          setKgNewPageDialogs("");
+                        }
+                      }}
+                    >
+                      Add Page
+                    </Button>
+                  </div>
+                  {kgForm.pages.length > 0 && (
+                    <div className="space-y-1">
+                      {kgForm.pages.map((pg, i) => (
+                        <div key={i} className="flex items-start justify-between bg-slate-50 rounded p-2 text-xs">
+                          <div>
+                            <span className="font-medium">{pg.route}</span>
+                            {pg.description && <span className="text-slate-500 ml-2">— {pg.description}</span>}
+                            {(pg.key_buttons || []).length > 0 && (
+                              <div className="text-slate-400 mt-0.5">Buttons: {pg.key_buttons.join(", ")}</div>
+                            )}
+                            {(pg.filters || []).length > 0 && (
+                              <div className="text-slate-400">Filters: {pg.filters.join(", ")}</div>
+                            )}
+                            {(pg.dialogs || []).length > 0 && (
+                              <div className="text-slate-400">Dialogs: {pg.dialogs.join(", ")}</div>
+                            )}
+                          </div>
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            className="text-red-500 h-6 px-2"
+                            onClick={() =>
+                              setKgForm((f) => ({
+                                ...f,
+                                pages: f.pages.filter((_, idx) => idx !== i),
+                              }))
+                            }
+                          >
+                            ✕
+                          </Button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                {/* Common Button Labels */}
+                <div className="space-y-2">
+                  <label className="text-xs font-medium">Common Button Labels</label>
+                  <div className="flex gap-2">
+                    <Input
+                      value={kgNewButtonLabel}
+                      onChange={(e) => setKgNewButtonLabel(e.target.value)}
+                      placeholder="Button label (e.g. Save)"
+                      className="text-sm"
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" && kgNewButtonLabel.trim()) {
+                          setKgForm((f) => ({
+                            ...f,
+                            common_button_labels: [...f.common_button_labels, kgNewButtonLabel.trim()],
+                          }));
+                          setKgNewButtonLabel("");
+                        }
+                      }}
+                    />
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={() => {
+                        if (kgNewButtonLabel.trim()) {
+                          setKgForm((f) => ({
+                            ...f,
+                            common_button_labels: [...f.common_button_labels, kgNewButtonLabel.trim()],
+                          }));
+                          setKgNewButtonLabel("");
+                        }
+                      }}
+                    >
+                      Add
+                    </Button>
+                  </div>
+                  {kgForm.common_button_labels.length > 0 && (
+                    <div className="flex flex-wrap gap-1">
+                      {kgForm.common_button_labels.map((lbl, i) => (
+                        <Badge
+                          key={i}
+                          variant="secondary"
+                          className="cursor-pointer"
+                          onClick={() =>
+                            setKgForm((f) => ({
+                              ...f,
+                              common_button_labels: f.common_button_labels.filter((_, idx) => idx !== i),
+                            }))
+                          }
+                        >
+                          {lbl} ✕
+                        </Badge>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                {/* Aria Labels */}
+                <div className="space-y-2">
+                  <label className="text-xs font-medium">Aria Labels</label>
+                  <div className="flex gap-2">
+                    <Input
+                      value={kgNewAriaLabel}
+                      onChange={(e) => setKgNewAriaLabel(e.target.value)}
+                      placeholder="aria-label (e.g. Toggle Sidebar)"
+                      className="text-sm"
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" && kgNewAriaLabel.trim()) {
+                          setKgForm((f) => ({
+                            ...f,
+                            aria_labels: [...f.aria_labels, kgNewAriaLabel.trim()],
+                          }));
+                          setKgNewAriaLabel("");
+                        }
+                      }}
+                    />
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={() => {
+                        if (kgNewAriaLabel.trim()) {
+                          setKgForm((f) => ({
+                            ...f,
+                            aria_labels: [...f.aria_labels, kgNewAriaLabel.trim()],
+                          }));
+                          setKgNewAriaLabel("");
+                        }
+                      }}
+                    >
+                      Add
+                    </Button>
+                  </div>
+                  {kgForm.aria_labels.length > 0 && (
+                    <div className="flex flex-wrap gap-1">
+                      {kgForm.aria_labels.map((lbl, i) => (
+                        <Badge
+                          key={i}
+                          variant="secondary"
+                          className="cursor-pointer"
+                          onClick={() =>
+                            setKgForm((f) => ({
+                              ...f,
+                              aria_labels: f.aria_labels.filter((_, idx) => idx !== i),
+                            }))
+                          }
+                        >
+                          {lbl} ✕
+                        </Badge>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              <DialogFooter>
+                <Button variant="outline" onClick={() => setKgDialogOpen(false)}>Cancel</Button>
+                <Button onClick={saveKG}>{editingKG ? "Update" : "Create"}</Button>
+              </DialogFooter>
+            </DialogContent>
+          </Dialog>
+        </TabsContent>
+
+        <TabsContent value="settings">
+          <Card className="p-6 space-y-6">
+            <div className="space-y-1">
+              <h2 className="text-lg font-semibold">Display Settings</h2>
+              <p className="text-sm text-slate-500">Configure UI appearance for this instance.</p>
+            </div>
+
+            <div className="flex items-center justify-between rounded-lg border border-slate-200 p-4">
+              <div className="space-y-0.5">
+                <p className="text-sm font-medium text-slate-900">Demo Banners</p>
+                <p className="text-xs text-slate-500">Show the red "DEMO" banners at the top and bottom of the screen.</p>
+              </div>
+              <button
+                role="switch"
+                aria-checked={demoBannerEnabled}
+                onClick={() => setDemoBannerEnabled(!demoBannerEnabled)}
+                className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2 ${
+                  demoBannerEnabled ? 'bg-blue-600' : 'bg-slate-200'
+                }`}
+              >
+                <span
+                  className={`pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow-lg ring-0 transition-transform ${
+                    demoBannerEnabled ? 'translate-x-5' : 'translate-x-0'
+                  }`}
+                />
+              </button>
+            </div>
           </Card>
         </TabsContent>
       </Tabs>

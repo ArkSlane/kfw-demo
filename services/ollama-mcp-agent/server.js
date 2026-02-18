@@ -11,6 +11,9 @@ const PORT = Number(process.env.PORT || 3000);
 
 const OLLAMA_URL = (process.env.OLLAMA_URL || 'http://ollama:11434').replace(/\/$/, '');
 const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'gpt-oss:20b';
+const OLLAMA_TEMPERATURE = Number(process.env.OLLAMA_TEMPERATURE ?? 0);
+const OLLAMA_TOP_P = Number(process.env.OLLAMA_TOP_P ?? 1);
+const OLLAMA_MAX_TOKENS = Number(process.env.OLLAMA_MAX_TOKENS ?? 2048);
 const OFFICIAL_MCP_URL = process.env.PLAYWRIGHT_MCP_OFFICIAL_URL || 'http://playwright-mcp-core:8931/mcp';
 const VIDEO_DIR = process.env.VIDEO_PATH || '/videos';
 
@@ -295,7 +298,9 @@ async function callOllamaChat({ messages, tools }) {
     tools,
     stream: false,
     options: {
-      temperature: 0
+      temperature: OLLAMA_TEMPERATURE,
+      top_p: OLLAMA_TOP_P,
+      max_tokens: OLLAMA_MAX_TOKENS
     }
   };
 

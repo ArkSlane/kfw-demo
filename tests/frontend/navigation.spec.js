@@ -17,8 +17,8 @@ test.describe('Side Navigation', () => {
   test('should display Administration link in footer', async ({ page }) => {
     await page.goto('/');
     
-    // Verify Administration link is visible
-    await expect(page.locator('text=Administration')).toBeVisible();
+    // Verify Admin link is visible
+    await expect(page.getByRole('link', { name: 'Admin' })).toBeVisible();
   });
 
   test('should display TestMaster branding', async ({ page }) => {
@@ -106,11 +106,11 @@ test.describe('Side Navigation', () => {
 
   test('should navigate to Administration page', async ({ page }) => {
     await page.goto('/');
-    await page.getByRole('link', { name: 'Administration' }).click();
+    await page.getByRole('link', { name: 'Admin' }).click();
     await page.waitForLoadState('networkidle');
     
     // Verify URL changed
-    expect(page.url()).toContain('/administration');
+    expect(page.url()).toContain('/admin');
   });
 
   test('should highlight active navigation item', async ({ page }) => {
@@ -131,15 +131,15 @@ test.describe('Side Navigation', () => {
   test('should highlight active Administration link', async ({ page }) => {
     await page.goto('/');
     
-    // Navigate to Administration
-    await page.click('text=Administration');
+    // Navigate to Admin
+    await page.getByRole('link', { name: 'Admin' }).click();
     await page.waitForLoadState('networkidle');
     
-    // Verify Administration link has active styling
-    const adminLink = page.locator('a:has-text("Administration")').first();
+    // Verify Admin link has active styling
+    const adminLink = page.getByRole('link', { name: 'Admin' });
     const classes = await adminLink.getAttribute('class');
-    expect(classes).toContain('bg-slate-100');
-    expect(classes).toContain('text-slate-700');
+    expect(classes).toContain('bg-blue-50');
+    expect(classes).toContain('text-blue-700');
   });
 
   test('should navigate between multiple pages', async ({ page }) => {

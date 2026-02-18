@@ -6,15 +6,14 @@ import pytest
 
 @pytest.mark.asyncio
 async def test_create_requirement_with_very_long_title(client):
-    """Test creating a requirement with a very long title."""
+    """Test creating a requirement with a very long title is rejected."""
     long_title = "R" * 1000
     payload = {"title": long_title}
     
     response = await client.post("/requirements", json=payload)
     
-    # Should succeed (no max length validation in current implementation)
-    assert response.status_code == 201
-    assert response.json()["title"] == long_title
+    # Should be rejected – max_length=500
+    assert response.status_code == 422
 
 
 @pytest.mark.asyncio
@@ -67,7 +66,7 @@ async def test_create_requirement_with_html(client):
 
 @pytest.mark.asyncio
 async def test_create_requirement_with_large_tag_array(client):
-    """Test creating a requirement with very large tag array."""
+    """Test creating a requirement with very large tag array is rejected."""
     large_tags = [f"tag{i}" for i in range(1000)]
     
     payload = {
@@ -77,9 +76,8 @@ async def test_create_requirement_with_large_tag_array(client):
     
     response = await client.post("/requirements", json=payload)
     
-    assert response.status_code == 201
-    data = response.json()
-    assert len(data["tags"]) == 1000
+    # Should be rejected – max_length=50 on tags list
+    assert response.status_code == 422
 
 
 @pytest.mark.asyncio

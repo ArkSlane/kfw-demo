@@ -4,18 +4,18 @@ from pydantic import BaseModel, Field
 
 # ---------- Requirements ----------
 class RequirementCreate(BaseModel):
-    title: str = Field(..., min_length=3)
-    description: Optional[str] = None
-    source: Optional[str] = None  # e.g. "code-analysis", "manual", "jira"
-    tags: List[str] = []
-    release_id: Optional[str] = None
+    title: str = Field(..., min_length=3, max_length=500)
+    description: Optional[str] = Field(None, max_length=50000)
+    source: Optional[str] = Field(None, max_length=100)  # e.g. "code-analysis", "manual", "jira"
+    tags: List[str] = Field(default=[], max_length=50)
+    release_id: Optional[str] = Field(None, max_length=50)
 
 class RequirementUpdate(BaseModel):
-    title: Optional[str] = Field(None, min_length=3)
-    description: Optional[str] = None
-    source: Optional[str] = None
-    tags: Optional[List[str]] = None
-    release_id: Optional[str] = None
+    title: Optional[str] = Field(None, min_length=3, max_length=500)
+    description: Optional[str] = Field(None, max_length=50000)
+    source: Optional[str] = Field(None, max_length=100)
+    tags: Optional[List[str]] = Field(None, max_length=50)
+    release_id: Optional[str] = Field(None, max_length=50)
 
 class RequirementOut(RequirementCreate):
     id: str
@@ -26,18 +26,18 @@ class RequirementOut(RequirementCreate):
 TestcaseStatus = Literal["draft", "ready", "passed", "failed", "approved", "inactive"]
 
 class TestcaseCreate(BaseModel):
-    requirement_id: str
-    title: str
-    gherkin: str
+    requirement_id: str = Field(..., max_length=50)
+    title: str = Field(..., max_length=500)
+    gherkin: str = Field(..., max_length=100000)
     status: TestcaseStatus = "draft"
-    version: int = 1
+    version: int = Field(1, ge=1, le=10000)
     metadata: dict = {}
 
 class TestcaseUpdate(BaseModel):
-    title: Optional[str] = None
-    gherkin: Optional[str] = None
+    title: Optional[str] = Field(None, max_length=500)
+    gherkin: Optional[str] = Field(None, max_length=100000)
     status: Optional[TestcaseStatus] = None
-    version: Optional[int] = None
+    version: Optional[int] = Field(None, ge=1, le=10000)
     metadata: Optional[dict] = None
 
 class TestcaseOut(TestcaseCreate):
@@ -47,7 +47,7 @@ class TestcaseOut(TestcaseCreate):
 
 # ---------- Generator ----------
 class GenerateRequest(BaseModel):
-    requirement_id: str
+    requirement_id: str = Field(..., max_length=50)
     mode: Literal["replace", "append"] = "append"  # how to store results
     amount: int = Field(1, ge=1, le=10)
 
@@ -56,20 +56,20 @@ class GenerateResult(BaseModel):
 
 # ---------- Releases ----------
 class ReleaseCreate(BaseModel):
-    name: str  # e.g. "2026.01"
-    description: Optional[str] = None
+    name: str = Field(..., max_length=200)  # e.g. "2026.01"
+    description: Optional[str] = Field(None, max_length=10000)
     from_date: Optional[datetime] = None
     to_date: Optional[datetime] = None
-    requirement_ids: List[str] = []
-    testcase_ids: List[str] = []
+    requirement_ids: List[str] = Field(default=[], max_length=500)
+    testcase_ids: List[str] = Field(default=[], max_length=2000)
 
 class ReleaseUpdate(BaseModel):
-    name: Optional[str] = None
-    description: Optional[str] = None
+    name: Optional[str] = Field(None, max_length=200)
+    description: Optional[str] = Field(None, max_length=10000)
     from_date: Optional[datetime] = None
     to_date: Optional[datetime] = None
-    requirement_ids: Optional[List[str]] = None
-    testcase_ids: Optional[List[str]] = None
+    requirement_ids: Optional[List[str]] = Field(None, max_length=500)
+    testcase_ids: Optional[List[str]] = Field(None, max_length=2000)
 
 class ReleaseOut(ReleaseCreate):
     id: str

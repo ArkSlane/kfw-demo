@@ -1,6 +1,11 @@
 import React from "react";
+import { useDemoSettings } from "@/lib/DemoSettingsContext";
 
 export default function DemoOverlay() {
+  const { demoBannerEnabled } = useDemoSettings();
+
+  if (!demoBannerEnabled) return null;
+
   return (
     <>
       <div aria-hidden="true" className="pointer-events-none fixed inset-x-0 top-0 z-[9999] flex justify-center">

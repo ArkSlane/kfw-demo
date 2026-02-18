@@ -6,15 +6,14 @@ import pytest
 
 @pytest.mark.asyncio
 async def test_create_release_with_very_long_name(client):
-    """Test creating a release with a very long name."""
+    """Test creating a release with a very long name is rejected."""
     long_name = "R" * 1000
     payload = {"name": long_name}
     
     response = await client.post("/releases", json=payload)
     
-    # Should succeed (no length validation in current implementation)
-    assert response.status_code == 201
-    assert response.json()["name"] == long_name
+    # Should be rejected – max_length=200
+    assert response.status_code == 422
 
 
 @pytest.mark.asyncio
@@ -67,7 +66,7 @@ async def test_create_release_with_html(client):
 
 @pytest.mark.asyncio
 async def test_create_release_with_large_id_arrays(client):
-    """Test creating a release with very large ID arrays."""
+    """Test creating a release with very large ID arrays is rejected."""
     large_req_ids = [f"req{i}" for i in range(1000)]
     large_tc_ids = [f"tc{i}" for i in range(2000)]
     
@@ -79,10 +78,8 @@ async def test_create_release_with_large_id_arrays(client):
     
     response = await client.post("/releases", json=payload)
     
-    assert response.status_code == 201
-    data = response.json()
-    assert len(data["requirement_ids"]) == 1000
-    assert len(data["testcase_ids"]) == 2000
+    # Should be rejected – max_length limits on arrays
+    assert response.status_code == 422
 
 
 @pytest.mark.asyncio

@@ -1,13 +1,33 @@
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from bson import ObjectId
-from shared.db import get_db
+from shared.db import get_db, close_client
 from shared.errors import setup_all_error_handlers
 from shared.health import check_mongodb, aggregate_health_status
-from shared.settings import MONGO_URL, DB_NAME
+from shared.settings import MONGO_URL, DB_NAME, CORS_ORIGINS, LOG_LEVEL, LOG_FORMAT_JSON, validate_settings
+from shared.logging_config import setup_logging, get_logger
+from shared.auth import setup_auth
+from shared.rate_limit import setup_rate_limiting
+from shared.indexes import ensure_indexes
+
+logger = get_logger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    setup_logging("executions", level=LOG_LEVEL, json_output=LOG_FORMAT_JSON)
+    validate_settings()
+    await ensure_indexes(get_db(), ["executions"])
+    logger.info("Executions service ready")
+    yield
+    await close_client()
+    logger.info("Executions service stopped")
+
 
 app = FastAPI(
+    lifespan=lifespan,
     title="Executions Service",
     version="1.0.0",
     description="""Service for tracking test execution history and results.
@@ -35,9 +55,12 @@ app = FastAPI(
 # Setup standardized error handlers
 setup_all_error_handlers(app)
 
+# Production middleware: auth, rate limiting, CORS
+setup_auth(app)
+setup_rate_limiting(app)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000"],
+    allow_origins=CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -62,22 +85,22 @@ from typing import Optional, Literal
 ResultType = Literal["passed", "failed", "blocked", "skipped"]
 
 class ExecutionCreate(BaseModel):
-    test_case_id: str
-    release_id: Optional[str] = None
+    test_case_id: str = Field(..., max_length=50)
+    release_id: Optional[str] = Field(None, max_length=50)
     execution_type: Literal["manual", "automated"] = "manual"
     result: ResultType
     execution_date: datetime = Field(default_factory=now)
-    executed_by: Optional[str] = None
-    notes: Optional[str] = None
-    duration_seconds: Optional[int] = None
+    executed_by: Optional[str] = Field(None, max_length=200)
+    notes: Optional[str] = Field(None, max_length=10000)
+    duration_seconds: Optional[int] = Field(None, ge=0, le=86400)
     metadata: dict = {}
 
 class ExecutionUpdate(BaseModel):
     result: Optional[ResultType] = None
     execution_date: Optional[datetime] = None
-    executed_by: Optional[str] = None
-    notes: Optional[str] = None
-    duration_seconds: Optional[int] = None
+    executed_by: Optional[str] = Field(None, max_length=200)
+    notes: Optional[str] = Field(None, max_length=10000)
+    duration_seconds: Optional[int] = Field(None, ge=0, le=86400)
     metadata: Optional[dict] = None
 
 class ExecutionOut(ExecutionCreate):

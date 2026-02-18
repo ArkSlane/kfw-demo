@@ -1,7 +1,7 @@
 import React from "react";
 import { Link, useLocation } from "react-router-dom";
 import { createPageUrl } from "@/utils";
-import { ClipboardList, FileText, ClipboardCheck, Bot, Menu, Package, PlayCircle, Sparkles } from "lucide-react";
+import { ClipboardList, FileText, ClipboardCheck, Bot, Menu, Package, PlayCircle, Sparkles, LogOut, User, Shield } from "lucide-react";
 import {
   Sidebar,
   SidebarContent,
@@ -17,6 +17,7 @@ import {
   SidebarFooter,
 } from "@/components/ui/sidebar";
 import DemoOverlay from "@/components/DemoOverlay";
+import { useAuth } from "@/lib/AuthContext";
 
 const navigationItems = [
   {
@@ -68,6 +69,16 @@ const navigationItems = [
 
 export default function Layout({ children }) {
   const location = useLocation();
+  const { user, logout, authEnabled } = useAuth();
+
+  const userRole = user?.role || 'viewer';
+  const isAdmin = userRole === 'admin';
+
+  const roleBadgeColors = {
+    admin: 'bg-red-100 text-red-700',
+    editor: 'bg-amber-100 text-amber-700',
+    viewer: 'bg-slate-100 text-slate-600',
+  };
 
   return (
     <SidebarProvider>
@@ -115,19 +126,51 @@ export default function Layout({ children }) {
 
           <SidebarFooter className="border-t border-slate-200 p-3">
             <SidebarMenu>
-              <SidebarMenuItem>
-                <SidebarMenuButton
-                  asChild
-                  className={`hover:bg-blue-50 hover:text-blue-700 transition-all duration-200 rounded-lg ${
-                    location.pathname === createPageUrl('admin') ? 'bg-blue-50 text-blue-700 font-medium' : ''
-                  }`}
-                >
-                  <Link to={createPageUrl('admin')} className="flex items-center gap-3 px-3 py-2.5">
-                    <span>Admin</span>
-                  </Link>
-                </SidebarMenuButton>
-              </SidebarMenuItem>
+              {/* Admin link — only shown to admin role */}
+              {isAdmin && (
+                <SidebarMenuItem>
+                  <SidebarMenuButton
+                    asChild
+                    className={`hover:bg-blue-50 hover:text-blue-700 transition-all duration-200 rounded-lg ${
+                      location.pathname === createPageUrl('admin') ? 'bg-blue-50 text-blue-700 font-medium' : ''
+                    }`}
+                  >
+                    <Link to={createPageUrl('admin')} className="flex items-center gap-3 px-3 py-2.5">
+                      <Shield className="w-4 h-4" />
+                      <span>Admin</span>
+                    </Link>
+                  </SidebarMenuButton>
+                </SidebarMenuItem>
+              )}
             </SidebarMenu>
+
+            {/* User info & logout */}
+            {user && (
+              <div className="mt-2 px-3 py-3 rounded-lg bg-slate-50 border border-slate-200">
+                <div className="flex items-center gap-2 mb-2">
+                  <div className="w-8 h-8 rounded-full bg-blue-100 flex items-center justify-center">
+                    <User className="w-4 h-4 text-blue-600" />
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm font-medium text-slate-800 truncate">{user.name || user.username}</p>
+                    <div className="flex items-center gap-1.5">
+                      <span className={`text-[10px] font-semibold uppercase px-1.5 py-0.5 rounded-full ${roleBadgeColors[userRole] || roleBadgeColors.viewer}`}>
+                        {userRole}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+                {authEnabled && (
+                  <button
+                    onClick={logout}
+                    className="w-full flex items-center justify-center gap-2 text-xs text-slate-500 hover:text-red-600 hover:bg-red-50 rounded-md py-1.5 transition-colors"
+                  >
+                    <LogOut className="w-3.5 h-3.5" />
+                    Sign out
+                  </button>
+                )}
+              </div>
+            )}
           </SidebarFooter>
         </Sidebar>
 

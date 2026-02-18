@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -8,13 +9,31 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from shared.db import get_db
+from shared.db import get_db, close_client
 from shared.errors import setup_all_error_handlers
 from shared.health import check_mongodb, aggregate_health_status
-from shared.settings import MONGO_URL, DB_NAME
+from shared.settings import MONGO_URL, DB_NAME, CORS_ORIGINS, LOG_LEVEL, LOG_FORMAT_JSON, validate_settings
+from shared.logging_config import setup_logging, get_logger
+from shared.auth import setup_auth
+from shared.rate_limit import setup_rate_limiting
+from shared.indexes import ensure_indexes
+
+logger = get_logger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    setup_logging("release-assessments", level=LOG_LEVEL, json_output=LOG_FORMAT_JSON)
+    validate_settings()
+    await ensure_indexes(get_db(), ["release_assessments"])
+    logger.info("Release Assessments service ready")
+    yield
+    await close_client()
+    logger.info("Release Assessments service stopped")
 
 
 app = FastAPI(
+    lifespan=lifespan,
     title="Release Assessments Service",
     version="1.0.0",
     description=(
@@ -37,9 +56,12 @@ app = FastAPI(
 
 setup_all_error_handlers(app)
 
+# Production middleware: auth, rate limiting, CORS
+setup_auth(app)
+setup_rate_limiting(app)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000"],
+    allow_origins=CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
