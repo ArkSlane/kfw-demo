@@ -8,6 +8,9 @@ import AIInsights from './pages/AIInsights';
 import ToabRkIa from './pages/ToabRkIa';
 import TestcaseMigration from './pages/TestcaseMigration';
 import Admin from './pages/Admin';
+import Locators from './pages/Locators';
+import ExtractRequirements from './pages/ExtractRequirements';
+import MergeRequestPipeline from './pages/MergeRequestPipeline';
 import Layout from './Layout.jsx';
 
 
@@ -21,6 +24,9 @@ export const PAGES = {
     "AIInsights": AIInsights,
     "toab-rk-ia": ToabRkIa,
     "testcase-migration": TestcaseMigration,
+    "Locators": Locators,
+    "extract-requirements": ExtractRequirements,
+    "mr-pipeline": MergeRequestPipeline,
     "admin": Admin,
 }
 

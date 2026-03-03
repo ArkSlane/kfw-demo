@@ -19,6 +19,7 @@ from fastapi import HTTPException
 
 Provider = Literal["github", "gitlab", "azureDevOps", "unknown"]
 AuthType = Literal["api-token", "ssh-key", "none"]
+RepoType = Literal["test_repository", "application_repository"]
 
 
 def now_iso() -> str:
@@ -38,6 +39,8 @@ class RepoConnection:
     api_token_id: Optional[str] = None
     ssh_key_name: Optional[str] = None
     branch: Optional[str] = None
+    repo_type: Optional[RepoType] = None
+    linked_repo_id: Optional[str] = None
 
 
 class RepoConnectionsStore:
@@ -70,6 +73,8 @@ class RepoConnectionsStore:
                         api_token_id=raw.get("api_token_id") or None,
                         ssh_key_name=raw.get("ssh_key_name") or None,
                         branch=raw.get("branch") or None,
+                        repo_type=raw.get("repo_type") or None,
+                        linked_repo_id=raw.get("linked_repo_id") or None,
                     )
                 )
             except Exception:
@@ -96,6 +101,8 @@ class RepoConnectionsStore:
                 api_token_id=raw.get("api_token_id") or None,
                 ssh_key_name=raw.get("ssh_key_name") or None,
                 branch=raw.get("branch") or None,
+                repo_type=raw.get("repo_type") or None,
+                linked_repo_id=raw.get("linked_repo_id") or None,
             )
         except HTTPException:
             raise
@@ -112,6 +119,8 @@ class RepoConnectionsStore:
         api_token_id: Optional[str] = None,
         ssh_key_name: Optional[str] = None,
         branch: Optional[str] = None,
+        repo_type: Optional[RepoType] = None,
+        linked_repo_id: Optional[str] = None,
     ) -> RepoConnection:
         connection_id = uuid4().hex
         created_at = now_iso()
@@ -128,6 +137,8 @@ class RepoConnectionsStore:
             "api_token_id": api_token_id,
             "ssh_key_name": ssh_key_name,
             "branch": branch,
+            "repo_type": repo_type,
+            "linked_repo_id": linked_repo_id,
         }
 
         path = self._path(connection_id)
@@ -154,6 +165,8 @@ class RepoConnectionsStore:
             api_token_id=api_token_id,
             ssh_key_name=ssh_key_name,
             branch=branch,
+            repo_type=repo_type,
+            linked_repo_id=linked_repo_id,
         )
 
     def update(self, connection: RepoConnection) -> RepoConnection:
@@ -173,6 +186,8 @@ class RepoConnectionsStore:
             "api_token_id": connection.api_token_id,
             "ssh_key_name": connection.ssh_key_name,
             "branch": connection.branch,
+            "repo_type": connection.repo_type,
+            "linked_repo_id": connection.linked_repo_id,
         }
 
         try:

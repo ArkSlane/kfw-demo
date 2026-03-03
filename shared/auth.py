@@ -224,15 +224,34 @@ async def require_auth(
         raise HTTPException(status_code=401, detail="Missing authorization header")
 
     return decode_token(credentials.credentials)
-
+import fnmatch as _fnmatch
 
 # ─── Auth middleware (blanket protection) ───────────────────────────────────
 class AuthMiddleware(BaseHTTPMiddleware):
     """Middleware that protects all routes except public paths."""
 
+    @staticmethod
+    def _is_public(path: str) -> bool:
+        """Check if *path* matches any entry in AUTH_PUBLIC_PATHS.
+
+        Supports simple glob patterns (e.g. ``/automations/*/video``)
+        as well as the original exact-match / prefix-match behaviour.
+        """
+        for p in AUTH_PUBLIC_PATHS:
+            p_clean = p.rstrip("/")
+            if "*" in p_clean:
+                # Glob-style match
+                if _fnmatch.fnmatch(path, p_clean):
+                    return True
+            else:
+                # Exact or prefix match (original behaviour)
+                if path == p_clean or path.startswith(p_clean + "/"):
+                    return True
+        return False
+
     async def dispatch(self, request: Request, call_next):
         path = request.url.path.rstrip("/")
-        if any(path == p.rstrip("/") or path.startswith(p.rstrip("/") + "/") for p in AUTH_PUBLIC_PATHS):
+        if self._is_public(path):
             return await call_next(request)
 
         if request.method == "OPTIONS":

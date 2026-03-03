@@ -36,8 +36,11 @@ function buildSystemPrompt({ recordVideo, videoPath } = {}) {
     'Track progress explicitly. Only mark a step complete after you have actually executed it via tool calls and confirmed the result via snapshots/tool output.',
     'Use browser_navigate to open pages. Use browser_snapshot to find elements and refs.',
     'When clicking, prefer providing both element (human description) and ref when available.',
-    'After navigation or clicks, use browser_wait_for(time=1) briefly if needed.',
+    'After navigation or clicks, use browser_wait_for(time=2) briefly to let the page settle.',
     'Avoid saving files unless explicitly asked (e.g., do not pass snapshot filenames unless required).',
+    'IMPORTANT: Step descriptions use APPROXIMATE field/button names. They may NOT match the exact text in the DOM.',
+    'When you cannot find an exact match for a button or field name from the steps, use browser_snapshot to see what is actually on the page and pick the closest matching element.',
+    'For input fields, try multiple strategies: look for matching labels, placeholders, or nearby text.',
     'When all steps are completed, STOP calling tools and reply with a short summary that begins with: DONE (completed_steps=X total_steps=Y)'
   ];
 

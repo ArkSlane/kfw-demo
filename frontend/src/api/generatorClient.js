@@ -1,14 +1,16 @@
-import axios from 'axios';
+import { createApiClient } from './httpClient';
 
 // jsconfig.json enables checkJs; cast import.meta to any for Vite env access.
 const viteEnv = /** @type {any} */ (import.meta).env;
 const GENERATOR_URL = viteEnv?.VITE_GENERATOR_URL || 'http://localhost:8003';
 
+const client = createApiClient(GENERATOR_URL);
+
 const generatorAPI = {
   generateAutomation: async (testCaseData) => {
     try {
       // Prefer execution-based generation that actually runs the steps via MCP + Ollama
-      const response = await axios.post(`${GENERATOR_URL}/generate-automation-from-execution`, {
+      const response = await client.post('/generate-automation-from-execution', {
         test_case_id: testCaseData.id,
       });
       return response.data; // { automation_id, title, framework, script_outline, notes, actions_taken }
@@ -20,7 +22,7 @@ const generatorAPI = {
 
   generateAutomationDraft: async (testCaseData) => {
     try {
-      const response = await axios.post(`${GENERATOR_URL}/generate-automation-draft-from-execution`, {
+      const response = await client.post('/generate-automation-draft-from-execution', {
         test_case_id: testCaseData.id,
       });
       return response.data; // { title, framework, script_outline, notes, actions_taken, exec_success, ... }
@@ -32,7 +34,7 @@ const generatorAPI = {
 
   automationChat: async ({ test_case_id, message, history = [], context = {} }) => {
     try {
-      const response = await axios.post(`${GENERATOR_URL}/automation-chat`, {
+      const response = await client.post('/automation-chat', {
         test_case_id,
         message,
         history,
@@ -47,7 +49,7 @@ const generatorAPI = {
 
   generateTestcases: async (requirementId, amount = 1, mode = 'append') => {
     try {
-      const response = await axios.post(`${GENERATOR_URL}/generate`, {
+      const response = await client.post('/generate', {
         requirement_id: requirementId,
         amount,
         mode,
@@ -61,7 +63,7 @@ const generatorAPI = {
 
   generateStructuredTestcase: async (requirementId) => {
     try {
-      const response = await axios.post(`${GENERATOR_URL}/generate-structured-testcase`, {
+      const response = await client.post('/generate-structured-testcase', {
         requirement_id: requirementId,
       });
       return response.data; // { testcase: { title, description, priority, steps }, generator, model, attempts }
@@ -73,7 +75,7 @@ const generatorAPI = {
 
   generateTestSuite: async (requirementId, positiveAmount = 3, negativeAmount = 2) => {
     try {
-      const response = await axios.post(`${GENERATOR_URL}/generate-test-suite`, {
+      const response = await client.post('/generate-test-suite', {
         requirement_id: requirementId,
         positive_amount: positiveAmount,
         negative_amount: negativeAmount,
@@ -86,7 +88,7 @@ const generatorAPI = {
   },
   
   executeScript: async (payload) => {
-    const response = await axios.post(`${GENERATOR_URL}/execute-script`, payload);
+    const response = await client.post('/execute-script', payload);
     return response.data;
   },
 };

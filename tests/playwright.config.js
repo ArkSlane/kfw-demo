@@ -5,7 +5,7 @@ import { defineConfig, devices } from '@playwright/test';
  * @see https://playwright.dev/docs/test-configuration
  */
 export default defineConfig({
-  testDir: './frontend',
+  testDir: './',
   
   // Maximum time one test can run
   timeout: 30 * 1000,
@@ -51,20 +51,46 @@ export default defineConfig({
 
   // Configure projects for major browsers
   projects: [
+    // Auth setup — runs first to create shared auth state
     {
-      name: 'chromium',
+      name: 'setup',
+      testMatch: /auth\.setup\.js/,
       use: { ...devices['Desktop Chrome'] },
     },
 
     {
-      name: 'firefox',
-      use: { ...devices['Desktop Firefox'] },
+      name: 'chromium',
+      use: {
+        ...devices['Desktop Chrome'],
+        storageState: 'test-results/.auth/user.json',
+      },
+      dependencies: ['setup'],
+      testDir: './frontend',
     },
 
-    {
-      name: 'webkit',
-      use: { ...devices['Desktop Safari'] },
-    },
+    // Firefox and WebKit require separate auth setup due to
+    // Keycloak cookie/token handling differences.
+    // Uncomment and add per-browser setup projects if needed.
+    //
+    // {
+    //   name: 'firefox',
+    //   use: {
+    //     ...devices['Desktop Firefox'],
+    //     storageState: 'test-results/.auth/user.json',
+    //   },
+    //   dependencies: ['setup'],
+    //   testDir: './frontend',
+    // },
+    //
+    // {
+    //   name: 'webkit',
+    //   use: {
+    //     ...devices['Desktop Safari'],
+    //     storageState: 'test-results/.auth/user.json',
+    //   },
+    //   dependencies: ['setup'],
+    //   testDir: './frontend',
+    // },
 
     // Mobile viewports
     // {

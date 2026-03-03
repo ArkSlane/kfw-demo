@@ -39,6 +39,7 @@ def create_error_response(
     error_data = {
         "error": error_type,
         "message": message,
+        "detail": message,
         "timestamp": datetime.now(timezone.utc).isoformat()
     }
     

@@ -1,13 +1,15 @@
-import axios from 'axios';
+import { createApiClient } from './httpClient';
 
 // jsconfig.json enables checkJs; cast import.meta to any for Vite env access.
 const viteEnv = /** @type {any} */ (import.meta).env;
 const TESTCASE_MIGRATION_URL = viteEnv?.VITE_TESTCASE_MIGRATION_URL || 'http://localhost:8009';
 
+const client = createApiClient(TESTCASE_MIGRATION_URL);
+
 const testcaseMigrationAPI = {
   health: async () => {
     try {
-      const res = await axios.get(`${TESTCASE_MIGRATION_URL}/health`);
+      const res = await client.get('/health');
       return res.data;
     } catch (error) {
       return null;
@@ -17,7 +19,7 @@ const testcaseMigrationAPI = {
   analyze: async ({ code, language = null }) => {
     const payload = { code };
     if (language) payload.language = language;
-    const res = await axios.post(`${TESTCASE_MIGRATION_URL}/analyze`, payload);
+    const res = await client.post('/analyze', payload);
     return res.data;
   },
 
@@ -25,7 +27,7 @@ const testcaseMigrationAPI = {
     const payload = { testcase };
     if (code) payload.code = code;
     if (Array.isArray(mapping) && mapping.length > 0) payload.mapping = mapping;
-    const res = await axios.post(`${TESTCASE_MIGRATION_URL}/generate-automation-draft`, payload);
+    const res = await client.post('/generate-automation-draft', payload);
     return res.data;
   },
 
@@ -35,7 +37,7 @@ const testcaseMigrationAPI = {
     if (framework) payload.framework = framework;
     if (notes) payload.notes = notes;
 
-    const res = await axios.post(`${TESTCASE_MIGRATION_URL}/save`, payload);
+    const res = await client.post('/save', payload);
     return res.data;
   },
 };

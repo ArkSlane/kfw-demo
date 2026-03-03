@@ -1,11 +1,14 @@
 import os
 import subprocess
 import tempfile
+import asyncio
+import json as _json
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, Optional
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import httpx
@@ -34,6 +37,8 @@ GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 GITLAB_TOKEN = os.getenv("GITLAB_TOKEN", "")
 AZURE_DEVOPS_TOKEN = os.getenv("AZURE_DEVOPS_TOKEN", "")
 AZURE_DEVOPS_ORG = os.getenv("AZURE_DEVOPS_ORG", "")
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gpt-oss:20b")
 
 # Initialize SSH key manager
 ssh_manager = SSHKeyManager(SSH_KEYS_DIR)
@@ -1101,6 +1106,8 @@ class RepoConnectionCreate(BaseModel):
     target_dir: str | None = None
     ssh_key_name: str | None = None
     api_token_id: str | None = None
+    repo_type: Literal["test_repository", "application_repository"] | None = None
+    linked_repo_id: str | None = None
 
 
 class RepoConnectionInfo(BaseModel):
@@ -1115,6 +1122,13 @@ class RepoConnectionInfo(BaseModel):
     api_token_id: str | None = None
     ssh_key_name: str | None = None
     branch: str | None = None
+    repo_type: Literal["test_repository", "application_repository"] | None = None
+    linked_repo_id: str | None = None
+
+
+class RepoConnectionUpdate(BaseModel):
+    repo_type: Literal["test_repository", "application_repository"] | None = None
+    linked_repo_id: str | None = None
 
 
 def provider_from_repo_url(repo_url: str) -> Literal["github", "gitlab", "azure", "unknown"]:
@@ -1153,6 +1167,14 @@ async def connect_repo(payload: RepoConnectionCreate) -> RepoConnectionInfo:
         raise HTTPException(status_code=400, detail="Provide either ssh_key_name or api_token_id, not both")
 
     validated_url = validate_repo_url(payload.repo_url)
+
+    # SSH URLs (git@...) need an SSH key, not an API token
+    if validated_url.startswith("git@") and payload.api_token_id and not payload.ssh_key_name:
+        raise HTTPException(
+            status_code=400,
+            detail="SSH URLs (git@...) require an SSH key for authentication. Use an HTTPS URL with an API token instead, e.g. https://github.com/org/repo.git",
+        )
+
     provider = provider_from_repo_url(validated_url)
     if provider == "unknown":
         raise HTTPException(status_code=400, detail="Unsupported Git provider")
@@ -1197,7 +1219,11 @@ async def connect_repo(payload: RepoConnectionCreate) -> RepoConnectionInfo:
                     stderr = redact_secret(stderr, secret)
                 except Exception:
                     pass
-            raise HTTPException(status_code=500, detail=f"Clone failed: {stderr}")
+            # Return 400 for auth / access errors, 500 for other failures
+            lower_err = (stderr or "").lower()
+            if "403" in lower_err or "401" in lower_err or "authentication failed" in lower_err or "access" in lower_err:
+                raise HTTPException(status_code=400, detail=f"Clone failed (access denied): {stderr.strip()}")
+            raise HTTPException(status_code=500, detail=f"Clone failed: {stderr.strip()}")
 
         # Ensure origin URL is stored without credentials.
         run_git_command(["remote", "set-url", "origin", validated_url], cwd=target)
@@ -1211,6 +1237,8 @@ async def connect_repo(payload: RepoConnectionCreate) -> RepoConnectionInfo:
             api_token_id=payload.api_token_id,
             ssh_key_name=payload.ssh_key_name,
             branch=payload.branch,
+            repo_type=payload.repo_type,
+            linked_repo_id=payload.linked_repo_id,
         )
         return conn.__dict__
     finally:
@@ -1277,6 +1305,232 @@ async def sync_repo_connection(connection_id: str) -> RepoConnectionInfo:
 async def disconnect_repo(connection_id: str):
     repo_connections_store.delete(connection_id)
     return {"id": connection_id, "deleted": True}
+
+
+@app.patch(
+    "/repo-connections/{connection_id}",
+    tags=["repo-connections"],
+    summary="Update repo connection metadata",
+    description="Update repo_type and/or linked_repo_id of an existing connection.",
+)
+async def update_repo_connection(connection_id: str, payload: RepoConnectionUpdate) -> RepoConnectionInfo:
+    conn = repo_connections_store.get(connection_id)
+    updates = {}
+    if payload.repo_type is not None:
+        updates["repo_type"] = payload.repo_type
+    if "linked_repo_id" in payload.model_fields_set:
+        updates["linked_repo_id"] = payload.linked_repo_id
+    if updates:
+        updated = RepoConnection(**{**conn.__dict__, **updates})
+        repo_connections_store.update(updated)
+        return updated.__dict__
+    return conn.__dict__
+
+
+# === Locator Analysis Endpoints ===
+
+from locator_scanner import update_code_with_locators, extract_locators_from_code
+
+# File extensions to scan for frontend components
+_FRONTEND_EXTENSIONS = {".jsx", ".tsx", ".vue", ".svelte", ".html", ".htm"}
+# Max file size to send to LLM (skip huge generated / bundled files)
+_MAX_FILE_SIZE = 60_000  # ~60 KB
+
+_LOCATOR_CONCURRENCY = 4  # analyse up to N files in parallel
+
+
+class LocatorAnalyzeRequest(BaseModel):
+    connection_id: str
+    path: str | None = None  # sub-path within the repo to limit scan (e.g. "src/pages")
+    files: list[str] | None = None  # specific files to analyze (relative paths); if set, only these are scanned
+
+
+class ExtractLocatorsRequest(BaseModel):
+    code: str
+
+
+def _collect_frontend_files(root: Path, sub_path: str | None = None) -> list[Path]:
+    """Walk a repo directory and collect front-end component files."""
+    base = root / sub_path if sub_path else root
+    if not base.exists():
+        raise HTTPException(status_code=404, detail=f"Path not found in repo: {sub_path or '/'}")
+    files: list[Path] = []
+    for p in sorted(base.rglob("*")):
+        if not p.is_file():
+            continue
+        if p.suffix.lower() not in _FRONTEND_EXTENSIONS:
+            continue
+        # Skip node_modules / dist / build / hidden dirs
+        rel = str(p.relative_to(root))
+        if any(part.startswith(".") or part in ("node_modules", "dist", "build", ".next", "__pycache__") for part in rel.split(os.sep)):
+            continue
+        if p.stat().st_size > _MAX_FILE_SIZE:
+            continue
+        files.append(p)
+    return files
+
+
+async def _process_file(file_path: Path, repo_root: Path) -> dict | None:
+    """Read a file, ask the LLM to add data-testid attributes, then extract
+    the locators from both the original and updated code.
+
+    Returns a dict ready to be sent as a batch result, or None on error.
+    """
+    try:
+        content = file_path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+
+    rel = str(file_path.relative_to(repo_root)).replace("\\", "/")
+    file_name = file_path.stem  # e.g. "Locators" from "Locators.jsx"
+
+    try:
+        previous_locators = extract_locators_from_code(content)
+    except Exception:
+        previous_locators = []
+
+    try:
+        response = await update_code_with_locators(
+            content,
+            file_name,
+            ollama_url=OLLAMA_URL,
+            ollama_model=OLLAMA_MODEL,
+        )
+        new_locators = extract_locators_from_code(response.code)
+        return {
+            "file": rel,
+            "previous_locators": previous_locators,
+            "locators": new_locators,
+            "code": response.code,
+            "message": response.message,
+        }
+    except Exception as exc:
+        logger.warning("Locator analysis failed for %s: %s", rel, exc)
+        return {
+            "file": rel,
+            "previous_locators": previous_locators,
+            "locators": [],
+            "code": content,
+            "message": f"Error: {exc}",
+            "error": str(exc),
+        }
+
+
+@app.post(
+    "/locators/analyze",
+    tags=["locators"],
+    summary="Analyze repo for test locators (streaming)",
+    description="""Scan frontend files in a connected repository and use AI to add
+data-testid attributes to interactive elements.  Results are streamed back as
+newline-delimited JSON so the UI can display them incrementally.
+
+For each file the LLM returns the full updated code.  BeautifulSoup then
+extracts the locators from both the original and updated code so the UI can
+show a before/after comparison.
+
+Event types on the stream:
+  - `{"type":"metadata", ...}` — first message with connection info & total files
+  - `{"type":"file_result", ...}` — one per file (streamed as each completes)
+  - `{"type":"done", ...}` — final summary""",
+)
+async def analyze_locators(payload: LocatorAnalyzeRequest):
+    conn = repo_connections_store.get(payload.connection_id)
+    repo_root = WORKSPACE_DIR / conn.repo_path
+    if not repo_root.exists():
+        raise HTTPException(status_code=404, detail="Repository checkout not found on disk")
+
+    if payload.files:
+        # User selected specific files — validate and resolve them
+        files: list[Path] = []
+        for rel in payload.files:
+            fp = repo_root / rel
+            if fp.is_file() and fp.suffix.lower() in _FRONTEND_EXTENSIONS:
+                files.append(fp)
+        if not files:
+            raise HTTPException(status_code=404, detail="None of the selected files exist or are scannable")
+    else:
+        files = _collect_frontend_files(repo_root, payload.path)
+        if not files:
+            raise HTTPException(status_code=404, detail="No frontend component files found in the specified path")
+
+    async def _stream():
+        # 1. metadata
+        yield _json.dumps({
+            "type": "metadata",
+            "connection_id": conn.id,
+            "repo_url": conn.repo_url,
+            "total_files": len(files),
+        }) + "\n"
+
+        sem = asyncio.Semaphore(_LOCATOR_CONCURRENCY)
+        result_queue: asyncio.Queue[dict | None] = asyncio.Queue()
+
+        async def _worker(f: Path):
+            async with sem:
+                res = await _process_file(f, repo_root)
+                await result_queue.put(res)
+
+        tasks = [asyncio.create_task(_worker(f)) for f in files]
+
+        files_done = 0
+        total_locators = 0
+
+        for _ in range(len(files)):
+            result = await result_queue.get()
+            files_done += 1
+
+            if result:
+                total_locators += len(result.get("locators", []))
+                yield _json.dumps({
+                    "type": "file_result",
+                    **result,
+                    "files_scanned_so_far": files_done,
+                    "total_files": len(files),
+                }) + "\n"
+
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+        # 3. done
+        yield _json.dumps({
+            "type": "done",
+            "files_scanned": len(files),
+            "total_locators": total_locators,
+        }) + "\n"
+
+    return StreamingResponse(_stream(), media_type="application/x-ndjson")
+
+
+@app.post(
+    "/locators/extract",
+    tags=["locators"],
+    summary="Extract existing data-testid locators from code",
+    description="Parse the provided code string and return all data-testid attributes found.",
+)
+async def extract_locators_endpoint(request: ExtractLocatorsRequest):
+    try:
+        locators = extract_locators_from_code(request.code)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    return {"locators": locators}
+
+
+@app.get(
+    "/locators/files/{connection_id}",
+    tags=["locators"],
+    summary="List scannable frontend files",
+    description="Returns a list of frontend component files in the repo that can be analyzed.",
+)
+async def list_locator_files(connection_id: str, path: str | None = None):
+    conn = repo_connections_store.get(connection_id)
+    repo_root = WORKSPACE_DIR / conn.repo_path
+    if not repo_root.exists():
+        raise HTTPException(status_code=404, detail="Repository checkout not found on disk")
+    files = _collect_frontend_files(repo_root, path)
+    return {
+        "connection_id": connection_id,
+        "files": [str(f.relative_to(repo_root)).replace("\\", "/") for f in files],
+        "count": len(files),
+    }
 
 
 # === LLM Connections Endpoints ===

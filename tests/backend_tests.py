@@ -78,9 +78,39 @@ def run_test(fn):
 
 
 # ====================================================================
+# Keycloak authentication
+# ====================================================================
+KEYCLOAK_URL = "http://localhost:8080"
+KEYCLOAK_REALM = "testmaster"
+KEYCLOAK_CLIENT_ID = "testmaster-app"
+KEYCLOAK_USERNAME = "admin"
+KEYCLOAK_PASSWORD = "admin123"
+
+def get_keycloak_token():
+    """Obtain an access token from Keycloak using the password grant."""
+    token_url = f"{KEYCLOAK_URL}/realms/{KEYCLOAK_REALM}/protocol/openid-connect/token"
+    r = httpx.post(token_url, data={
+        "grant_type": "password",
+        "client_id": KEYCLOAK_CLIENT_ID,
+        "username": KEYCLOAK_USERNAME,
+        "password": KEYCLOAK_PASSWORD,
+    }, timeout=15)
+    if r.status_code != 200:
+        print(f"  [WARN] Failed to obtain Keycloak token ({r.status_code}): {r.text[:200]}")
+        print("  Tests will run without authentication — expect 401 errors if AUTH_ENABLED=true")
+        return None
+    token = r.json().get("access_token")
+    print(f"  [OK] Obtained Keycloak access token for user '{KEYCLOAK_USERNAME}'")
+    return token
+
+print("\n===== 0. AUTHENTICATION =====")
+_token = get_keycloak_token()
+_auth_headers = {"Authorization": f"Bearer {_token}"} if _token else {}
+
+# ====================================================================
 # HTTP helpers
 # ====================================================================
-client = httpx.Client(timeout=30)
+client = httpx.Client(timeout=30, headers=_auth_headers)
 
 
 def get(url, expected_status=200):

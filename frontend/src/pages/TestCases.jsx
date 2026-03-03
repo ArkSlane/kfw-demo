@@ -260,6 +260,15 @@ export default function TestCases() {
       setAutomationDraft(draft);
       setAutomationDraftTestCase(testCase);
       setAutomationChatMessages([]);
+
+      // Pre-populate the video URL so the recording shows immediately in the dialog
+      if (draft.video_filename) {
+        const raw = automationsAPI.getRawVideoUrl(draft.video_filename);
+        setAutomationVideoUrl(`${raw}?t=${Date.now()}`);
+      } else {
+        setAutomationVideoUrl(null);
+      }
+
       setAutomationReviewOpen(true);
 
       toast.success('Automation draft generated. Review before saving.');

@@ -391,19 +391,41 @@ app.post('/execute', async (req, res) => {
     // Prepend viewport sizing so the Playwright page uses the same resolution as the recorded video.
     const fnCode = `async (page) => {\n  try { await page.setViewportSize({ width: ${VIDEO_WIDTH}, height: ${VIDEO_HEIGHT} }); } catch (e) {}\n${script}\n}`;
 
-    await withMcpClient(async (client) => {
-    actionLog.push('Action: browser_run_code(script)');
-    const runResult = await callTool(client, 'browser_run_code', { code: fnCode });
-      const runText = textFromToolResult(runResult);
-      if (runText) {
-        actionLog.push('Result:');
-        actionLog.push(runText);
-      }
+    let scriptError = null;
 
-      // Give the recorder a moment to capture the final UI state.
+    await withMcpClient(async (client) => {
+      // Give the video recorder a moment to start capturing
       if (record_video) {
         try {
-          await callTool(client, 'browser_wait_for', { time: 1 });
+          await callTool(client, 'browser_wait_for', { time: 2 });
+        } catch {
+          // best-effort
+        }
+      }
+
+      actionLog.push('Action: browser_run_code(script)');
+      try {
+        const runResult = await callTool(client, 'browser_run_code', { code: fnCode });
+        const runText = textFromToolResult(runResult);
+        if (runText) {
+          actionLog.push('Result:');
+          actionLog.push(runText);
+        }
+        // Check if the result indicates an error (MCP isError flag)
+        if (runResult && runResult.isError) {
+          scriptError = runText || 'Script execution failed';
+          actionLog.push(`ScriptError: ${scriptError}`);
+        }
+      } catch (runErr) {
+        scriptError = runErr?.message || String(runErr);
+        actionLog.push(`ScriptError: ${scriptError}`);
+      }
+
+      // ALWAYS give the recorder time to capture the final UI state and close the browser
+      // to finalize the video, regardless of whether the script succeeded or failed.
+      if (record_video) {
+        try {
+          await callTool(client, 'browser_wait_for', { time: 3 });
         } catch {
           // best-effort
         }
@@ -421,16 +443,37 @@ app.post('/execute', async (req, res) => {
       videoSaved = await maybeRenameNewestVideo({ runStartedAt, video_path });
     }
 
+    // Report success only if the script itself didn't error
+    const success = !scriptError;
+
     return res.json({
-      success: true,
-      message: 'Execution completed',
+      success,
+      error: scriptError || undefined,
+      message: success ? 'Execution completed' : `Execution failed: ${scriptError}`,
       actions_taken: actionLog.join('\n'),
       video_saved: videoSaved,
       video_filename: videoSaved && video_path ? String(video_path) : null
     });
   } catch (e) {
     actionLog.push(`Error: ${e?.message || String(e)}`);
-    return res.status(200).json({ success: false, error: e?.message || String(e), actions_taken: actionLog.join('\n') });
+
+    // Best-effort: try to save the video even when the outer flow errors out
+    let videoSaved = false;
+    if (record_video && video_path) {
+      try {
+        videoSaved = await maybeRenameNewestVideo({ runStartedAt, video_path });
+      } catch {
+        // ignore
+      }
+    }
+
+    return res.status(200).json({
+      success: false,
+      error: e?.message || String(e),
+      actions_taken: actionLog.join('\n'),
+      video_saved: videoSaved,
+      video_filename: videoSaved && video_path ? String(video_path) : null
+    });
   }
 });
 
@@ -450,6 +493,14 @@ app.post('/execute-test', async (req, res) => {
       } catch (e) {
         // continue if tool not available
       }
+
+      // Give the video recorder a moment to start capturing
+      try {
+        await callTool(client, 'browser_wait_for', { time: 2 });
+      } catch {
+        // best-effort
+      }
+
       // Navigate can be inferred from any step containing a URL
       for (const step of parsedSteps) {
         const text = step.text || '';
@@ -459,7 +510,7 @@ app.post('/execute-test', async (req, res) => {
           actionLog.push(`Action: navigate(${normalized})`);
           await callTool(client, 'browser_navigate', { url: normalized });
           // Give the SPA a moment to settle
-          await callTool(client, 'browser_wait_for', { time: 1 });
+          await callTool(client, 'browser_wait_for', { time: 2 });
           break;
         }
       }
@@ -483,7 +534,7 @@ app.post('/execute-test', async (req, res) => {
           continue;
         }
 
-        // For clicks/ticks/checks: use snapshot + ref lookup
+        // For clicks/ticks/checks: use snapshot + ref lookup with fuzzy matching
         if (/(click|press|tap|open|select|tick|check)/i.test(lower)) {
           const target = extractQuotedOrLastWords(text);
           const snapResult = await callTool(client, 'browser_snapshot', {});
@@ -491,12 +542,45 @@ app.post('/execute-test', async (req, res) => {
 
           const found = findRefInSnapshot(snapshot, target);
           if (!found) {
-            actionLog.push(`ActionError: could not find ref for "${target}"`);
-            break;
+            // Try with individual words from the target for fuzzy matching
+            const words = target.split(/\s+/).filter(Boolean);
+            let fuzzyFound = null;
+            if (words.length > 1) {
+              for (const word of words) {
+                if (word.length < 3) continue;
+                fuzzyFound = findRefInSnapshot(snapshot, word);
+                if (fuzzyFound) break;
+              }
+            }
+            if (!fuzzyFound) {
+              actionLog.push(`ActionError: could not find ref for "${target}" (tried fuzzy matching)`);
+              completedSteps++;
+              continue; // Skip this step instead of breaking the whole run
+            }
+            actionLog.push(`Action: click(ref=${fuzzyFound.ref}, target=${target} [fuzzy])`);
+            await callTool(client, 'browser_click', { element: target, ref: fuzzyFound.ref });
+          } else {
+            actionLog.push(`Action: click(ref=${found.ref}, target=${target})`);
+            await callTool(client, 'browser_click', { element: target, ref: found.ref });
           }
+          await callTool(client, 'browser_wait_for', { time: 1 });
+          completedSteps++;
+          continue;
+        }
 
-          actionLog.push(`Action: click(ref=${found.ref}, target=${target})`);
-          await callTool(client, 'browser_click', { element: target, ref: found.ref });
+        // Fill/type/enter actions: use snapshot + ref lookup for input fields
+        if (/(fill|type|enter|input)/i.test(lower)) {
+          const target = extractQuotedOrLastWords(text);
+          const snapResult = await callTool(client, 'browser_snapshot', {});
+          const snapshot = textFromToolResult(snapResult);
+
+          const found = findRefInSnapshot(snapshot, target);
+          if (found) {
+            actionLog.push(`Action: type(ref=${found.ref}, target=${target})`);
+            await callTool(client, 'browser_type', { element: target, ref: found.ref, text: target });
+          } else {
+            actionLog.push(`ActionWarning: could not find input for "${target}"`);
+          }
           await callTool(client, 'browser_wait_for', { time: 1 });
           completedSteps++;
           continue;
@@ -518,12 +602,16 @@ app.post('/execute-test', async (req, res) => {
 
       actionLog.push(`Completed ${completedSteps}/${parsedSteps.length} steps`);
 
-      if (video_path) {
-        try {
-          await callTool(client, 'browser_close', {});
-        } catch {
-          // best-effort
-        }
+      // Always close the browser to finalize video recording
+      try {
+        await callTool(client, 'browser_wait_for', { time: 3 });
+      } catch {
+        // best-effort
+      }
+      try {
+        await callTool(client, 'browser_close', {});
+      } catch {
+        // best-effort
       }
     });
 

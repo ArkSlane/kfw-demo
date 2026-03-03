@@ -76,6 +76,7 @@ APP_KNOWLEDGE_GRAPH: dict = {
                 {"label": "Testcase Migration", "route": "/testcase-migration"},
                 {"label": "Automations", "route": "/Automations"},
                 {"label": "Executions", "route": "/Executions"},
+                {"label": "Locators", "route": "/Locators"},
             ],
             "footer_items": [{"label": "Admin", "route": "/admin"}],
         },
@@ -140,6 +141,11 @@ APP_KNOWLEDGE_GRAPH: dict = {
             "description": "Administration: tokens, repos, users, health, AI settings.",
             "tabs": ["API tokens", "Repo connections", "User management", "Service health", "AI inclusion", "Test approach"],
             "key_buttons": ["Save token", "Connect", "Add user", "Save", "Delete (per-row)"],
+        },
+        "/Locators": {
+            "description": "AI-powered test locator analysis. Select a repo, scan frontend files, get data-testid suggestions.",
+            "key_buttons": ["Preview Files", "Analyze Locators"],
+            "interactive": ["Repo selector", "Sub-path filter input", "Collapsible file results with copy-to-clipboard"],
         },
     },
     "common_button_labels": [
@@ -389,8 +395,8 @@ app = FastAPI(
 
 async def _execute_script_with_retries(client: httpx.AsyncClient, script: str, video_filename: str | None = None, *,
     record_video: bool = True,
-    max_retries: int = 3,
-    base_timeout: int = 15,
+    max_retries: int = 2,
+    base_timeout: int = 120,
     max_video_bytes: int = 50_000_000,
 ) -> dict:
     """Execute a Playwright script via Playwright-MCP with retries and per-request timeouts.
@@ -476,7 +482,13 @@ async def _repair_and_rerun(
             "- NEVER use page.evaluate() to inspect DOM elements or read className/attributes.\n"
             "- SVG elements do NOT have a string className – never call .className.split().\n"
             "- For reading text, use page.locator('selector').textContent() instead of page.evaluate.\n"
-            "- For verifying elements, use page.locator('selector').waitFor() or .isVisible().\n\n"
+            "- For verifying elements, use page.locator('selector').waitFor() or .isVisible().\n"
+            "- ALWAYS use { exact: false } for getByRole name, getByText: e.g. page.getByRole('button', {name:'Label', exact: false}).\n"
+            "- For input fields, try getByLabel (exact:false) first, then getByPlaceholder, then locator('input[name=...]').\n"
+            "- Field names in test steps are APPROXIMATE — use partial/fuzzy matching.\n"
+            "- Add { timeout: 10000 } to .click(), .fill(), .waitFor() calls so failures are detected quickly.\n"
+            "- Start script with: await page.waitForTimeout(2000); // ensure video recording captures content.\n"
+            "- End script with: await page.waitForTimeout(2000); // ensure video captures final state.\n\n"
         )
         if kg_block:
             prompt += (
@@ -494,6 +506,7 @@ async def _repair_and_rerun(
         prompt += (
             "Please make minimal edits necessary to fix the failure (selectors, waits, ordering). "
             "Replace any page.evaluate() DOM reads with page.locator() equivalents. "
+            "Use { exact: false } for text matching and add { timeout: 10000 } to interactions. "
             "If you cannot determine a fix, return the original script unchanged."
         )
 
@@ -1202,9 +1215,14 @@ async def _build_llm_execution_context(client: httpx.AsyncClient, test_case: dic
 def build_fallback_script_from_steps(steps) -> str:
     """Best-effort script when MCP/LLM execution cannot produce actions."""
     if not steps:
-        return "// TODO: No steps provided"
+        return "// TODO: No steps provided\nawait page.waitForTimeout(2000);"
 
     lines: list[str] = []
+    # Ensure video recording captures content from the start
+    lines.append("// Initial wait for video recording to start")
+    lines.append("await page.waitForTimeout(2000);")
+    lines.append("")
+
     if isinstance(steps, str):
         steps_iter = [steps]
     elif isinstance(steps, list):
@@ -1212,6 +1230,7 @@ def build_fallback_script_from_steps(steps) -> str:
     else:
         steps_iter = [steps]
 
+    has_navigation = False
     for i, step in enumerate(steps_iter, start=1):
         if isinstance(step, dict):
             action = (step.get("action") or "").strip()
@@ -1230,16 +1249,28 @@ def build_fallback_script_from_steps(steps) -> str:
         url_match = _URL_RE.search(action)
         if url_match:
             lines.append(f"await page.goto({_js_single_quoted(rewrite_localhost_url(url_match.group(1)))});")
+            lines.append("await page.waitForLoadState('networkidle');")
+            has_navigation = True
             continue
 
         # Handle bare localhost-like hosts without a scheme.
         bare_match = _BARE_LOCALHOST_RE.search(action)
         if bare_match:
             lines.append(f"await page.goto({_js_single_quoted(rewrite_localhost_url(bare_match.group(0)))});")
+            lines.append("await page.waitForLoadState('networkidle');")
+            has_navigation = True
+            continue
+
+        lowered = action.lower()
+
+        # Navigate/open hints without explicit URL — go to the docker frontend base
+        if not has_navigation and any(kw in lowered for kw in ("navigate", "open", "go to", "visit")):
+            lines.append("await page.goto('http://frontend:5173');")
+            lines.append("await page.waitForLoadState('networkidle');")
+            has_navigation = True
             continue
 
         # Wait hints like "wait 1500" or "wait for 2 seconds"
-        lowered = action.lower()
         if "wait" in lowered:
             num_match = re.search(r"(\d+)", lowered)
             if num_match:
@@ -1252,8 +1283,38 @@ def build_fallback_script_from_steps(steps) -> str:
                 lines.append("await page.waitForTimeout(1000);")
             continue
 
-    # Ensure a tiny tail wait so recordings are non-trivial
-    lines.append("await page.waitForTimeout(1000);")
+        # Click actions — try to extract a target label
+        if any(kw in lowered for kw in ("click", "press", "tap", "select", "check", "toggle")):
+            # Extract quoted target or last meaningful words
+            quoted = re.search(r'"([^"]+)"|\'([^\']+)\'', action)
+            if quoted:
+                target = quoted.group(1) or quoted.group(2)
+            else:
+                # Grab words after the action verb
+                after = re.search(r'\b(?:click|press|tap|select|check|toggle)\b\s+(?:on\s+|the\s+)?(.+)', lowered)
+                target = after.group(1).strip() if after else action
+            lines.append(f"await page.getByRole('button', {{name: '{target}', exact: false}}).or(page.getByText('{target}', {{exact: false}})).first().click({{timeout: 10000}});")
+            lines.append("await page.waitForTimeout(500);")
+            continue
+
+        # Fill/type/enter actions
+        if any(kw in lowered for kw in ("fill", "type", "enter", "input")):
+            quoted = re.search(r'"([^"]+)"|\'([^\']+)\'', action)
+            value = (quoted.group(1) or quoted.group(2)) if quoted else "test value"
+            # Try to extract field name
+            field_match = re.search(r'\b(?:in|into|field|input)\b\s+(?:the\s+)?["\']?(\w[\w\s]*\w)["\']?', lowered)
+            field_name = field_match.group(1).strip() if field_match else "input"
+            lines.append(f"await page.getByLabel('{field_name}', {{exact: false}}).or(page.getByPlaceholder('{field_name}', {{exact: false}})).first().fill('{value}', {{timeout: 10000}});")
+            lines.append("await page.waitForTimeout(500);")
+            continue
+
+        # Snapshot / observe action
+        lines.append("await page.waitForTimeout(1000);")
+
+    # Ensure a generous tail wait so recordings capture final state
+    lines.append("")
+    lines.append("// Final wait for video recording to capture final state")
+    lines.append("await page.waitForTimeout(2000);")
     return "\n".join(lines)
 
 def simple_gherkin(requirement_title: str, requirement_desc: str | None, idx: int) -> str:
@@ -1713,6 +1774,16 @@ async def _generate_playwright_script_single_call(
         "- For links: await page.getByRole('link', {name:'Label'}).click();\n",
         "- Add await page.waitForTimeout(500); after interactions that trigger navigation.\n",
         "- Prefer .first() when a selector may match multiple elements.\n\n",
+        "RESILIENT SELECTOR RULES (follow strictly):\n",
+        "- ALWAYS use { exact: false } for getByRole name matching: page.getByRole('button', {name:'Label', exact: false})\n",
+        "- ALWAYS use { exact: false } for getByText: page.getByText('some text', {exact: false})\n",
+        "- For input fields, try MULTIPLE strategies in order: getByLabel > getByPlaceholder > locator('input[name=...]')\n",
+        "- Field names in test steps are APPROXIMATE — they may not match exact DOM labels. Use partial/fuzzy matching.\n",
+        "- Add { timeout: 10000 } to .click(), .fill(), .waitFor() calls so failures are detected quickly.\n",
+        "- Example: await page.getByRole('button', {name:'Submit', exact: false}).click({timeout: 10000});\n",
+        "- Example: await page.getByLabel('user', {exact: false}).fill('value', {timeout: 10000});\n",
+        "- Start every script with: await page.waitForTimeout(2000); // ensure video recording captures content\n",
+        "- End every script with: await page.waitForTimeout(2000); // ensure video captures final state\n\n",
         f"Docker base URL: {base_url_hint}\n",
         "Replace any localhost/127.0.0.1/0.0.0.0 URLs with the Docker base URL.\n\n",
         "=== APPLICATION KNOWLEDGE GRAPH ===\n",
@@ -1844,7 +1915,13 @@ async def generate_playwright_script_step_by_step_with_ollama(
                 "- Use page.getByRole(), page.getByText(), page.getByLabel(), page.locator() — NEVER page.evaluate().\n",
                 "- SVG elements have no string className.\n",
                 "- Prefer .first() when a selector may match multiple elements.\n",
-                "- Add short waits after navigation: await page.waitForLoadState('networkidle');\n\n",
+                "- Add short waits after navigation: await page.waitForLoadState('networkidle');\n",
+                "- ALWAYS use { exact: false } for getByRole name, getByText: e.g. page.getByRole('button', {name:'Label', exact: false})\n",
+                "- For input fields, try getByLabel first (with exact:false), then getByPlaceholder, then locator('input[name=...]').\n",
+                "- Field names in steps are APPROXIMATE — use partial/fuzzy matching.\n",
+                "- Add { timeout: 10000 } to .click(), .fill(), .waitFor() so failures are detected quickly.\n",
+                "- Start every script with: await page.waitForTimeout(2000); // ensure video recording\n",
+                "- End every script with: await page.waitForTimeout(2000); // ensure video captures final state\n\n",
                 f"Docker base URL: {base_url_hint}\n",
                 "Replace any localhost/127.0.0.1 URLs with the Docker base URL.\n\n",
                 "=== APP KNOWLEDGE GRAPH (routes, buttons, selectors) ===\n",
@@ -2101,9 +2178,6 @@ async def generate_automation_from_execution(payload: ExecutionGenerateRequest, 
                     # adopt repaired script for persistence if it succeeded
                     if exec_success:
                         script_outline = repaired_script
-                # annotate generation metadata with repair results
-                generation_metadata["repair_attempts"] = repair_attempts
-                generation_metadata["repair_exec_data"] = repair_exec_data or {}
             except Exception:
                 # swallow repair errors; keep original exec_error
                 pass
@@ -2155,7 +2229,7 @@ async def generate_automation_from_execution(payload: ExecutionGenerateRequest, 
         }
 
         # If we know a video was saved, store the absolute path used by the automations service.
-        if exec_success and video_saved:
+        if video_saved:
             automation_data["video_path"] = f"/videos/{video_filename}"
 
         save_resp = await client.post(f"{AUTOMATIONS_URL}/automations", json=automation_data)
@@ -2267,8 +2341,6 @@ async def generate_automation_draft_from_execution(payload: ExecutionGenerateReq
                         exec_error = exec_error or repair_hidden
                     if exec_success:
                         script_outline = repaired_script
-                generation_metadata["repair_attempts"] = repair_attempts
-                generation_metadata["repair_exec_data"] = repair_exec_data or {}
             except Exception:
                 pass
 
@@ -2288,7 +2360,7 @@ async def generate_automation_draft_from_execution(payload: ExecutionGenerateReq
         framework = "playwright"
 
         video_path: str | None = None
-        if exec_success and video_saved:
+        if video_saved:
             video_path = f"/videos/{video_filename}"
 
         return AutomationDraftOut(

@@ -104,6 +104,8 @@ export default function Admin() {
   const [repos, setRepos] = useState([]);
   const [loadingRepos, setLoadingRepos] = useState(false);
   const [repoUrl, setRepoUrl] = useState("");
+  const [repoType, setRepoType] = useState("application_repository");
+  const [linkedRepoId, setLinkedRepoId] = useState(null);
   const [selectedTokenId, setSelectedTokenId] = useState(null);
   const [tokenPickerOpen, setTokenPickerOpen] = useState(false);
 
@@ -392,14 +394,17 @@ export default function Admin() {
     }
 
     try {
-      await gitRepoConnectionsAPI.connect({ repo_url: url, api_token_id: selectedTokenId });
+      await gitRepoConnectionsAPI.connect({ repo_url: url, api_token_id: selectedTokenId, repo_type: repoType, linked_repo_id: linkedRepoId });
       setRepoUrl("");
       setSelectedTokenId(null);
+      setRepoType("application_repository");
+      setLinkedRepoId(null);
       toast.success("Repo cloned and connected");
       await refreshRepos();
     } catch (e) {
       console.error("Failed to connect repo", e);
-      const msg = e?.response?.data?.detail || e?.message || "Failed to connect repo";
+      const rd = e?.response?.data;
+      const msg = rd?.detail || rd?.message || e?.message || "Failed to connect repo";
       toast.error(msg);
     }
   };
@@ -426,6 +431,19 @@ export default function Admin() {
       toast.error(msg);
     }
   };
+
+  const updateRepoMeta = async (id, data) => {
+    try {
+      await gitRepoConnectionsAPI.update(id, data);
+      toast.success("Repo updated");
+      await refreshRepos();
+    } catch (e) {
+      console.error("Failed to update repo", e);
+      toast.error("Failed to update repo");
+    }
+  };
+
+  const testRepos = useMemo(() => repos.filter((r) => r.repo_type === "test_repository"), [repos]);
 
   const addUser = () => {
     if (!newUserName.trim()) {
@@ -632,6 +650,9 @@ export default function Admin() {
                 {repoProviderHint !== "unknown" ? (
                   <div className="text-xs text-slate-500">Detected provider: {repoProviderHint}</div>
                 ) : null}
+                {repoUrl.trim().startsWith("git@") ? (
+                  <div className="text-xs text-amber-600">⚠ SSH URLs require an SSH key. Use an HTTPS URL (e.g. https://github.com/org/repo.git) when authenticating with an API token.</div>
+                ) : null}
               </div>
 
               <div className="space-y-2">
@@ -647,6 +668,38 @@ export default function Admin() {
                   </div>
                 ) : null}
               </div>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+              <div className="space-y-2">
+                <div className="text-xs text-slate-600">Repository type</div>
+                <Select value={repoType} onValueChange={(v) => { setRepoType(v); if (v === "test_repository") setLinkedRepoId(null); }}>
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="application_repository">Application Repository</SelectItem>
+                    <SelectItem value="test_repository">Test Repository</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+
+              {repoType === "application_repository" && testRepos.length > 0 ? (
+                <div className="space-y-2 lg:col-span-2">
+                  <div className="text-xs text-slate-600">Linked test repository (optional)</div>
+                  <Select value={linkedRepoId || "__none__"} onValueChange={(v) => setLinkedRepoId(v === "__none__" ? null : v)}>
+                    <SelectTrigger>
+                      <SelectValue placeholder="Select test repository" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="__none__">— None —</SelectItem>
+                      {testRepos.map((tr) => (
+                        <SelectItem key={tr.id} value={tr.id}>{tr.repo_url}</SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+              ) : null}
             </div>
 
             <div className="flex justify-end">
@@ -665,27 +718,60 @@ export default function Admin() {
                   <TableHeader>
                     <TableRow>
                       <TableHead>Repo</TableHead>
+                      <TableHead>Type</TableHead>
+                      <TableHead>Linked Test Repo</TableHead>
                       <TableHead>Provider</TableHead>
-                      <TableHead>Token</TableHead>
                       <TableHead>Status</TableHead>
-                      <TableHead>Last synced</TableHead>
                       <TableHead className="text-right">Actions</TableHead>
                     </TableRow>
                   </TableHeader>
                   <TableBody>
                     {repos.map((r) => {
                       const t = tokens.find((x) => x.id === r.api_token_id);
+                      const linkedRepo = r.linked_repo_id ? repos.find((x) => x.id === r.linked_repo_id) : null;
                       return (
                         <TableRow key={r.id}>
-                          <TableCell className="text-slate-800">{r.repo_url}</TableCell>
+                          <TableCell className="text-slate-800 max-w-xs truncate" title={r.repo_url}>{r.repo_url}</TableCell>
+                          <TableCell>
+                            <Select
+                              value={r.repo_type || "application_repository"}
+                              onValueChange={(v) => updateRepoMeta(r.id, { repo_type: v, linked_repo_id: v === "test_repository" ? null : r.linked_repo_id })}
+                            >
+                              <SelectTrigger className="h-8 w-[160px] text-xs">
+                                <SelectValue />
+                              </SelectTrigger>
+                              <SelectContent>
+                                <SelectItem value="application_repository">Application</SelectItem>
+                                <SelectItem value="test_repository">Test Repo</SelectItem>
+                              </SelectContent>
+                            </Select>
+                          </TableCell>
+                          <TableCell>
+                            {(r.repo_type || "application_repository") === "application_repository" ? (
+                              <Select
+                                value={r.linked_repo_id || "__none__"}
+                                onValueChange={(v) => updateRepoMeta(r.id, { linked_repo_id: v === "__none__" ? null : v })}
+                              >
+                                <SelectTrigger className="h-8 w-[200px] text-xs">
+                                  <SelectValue placeholder="— None —" />
+                                </SelectTrigger>
+                                <SelectContent>
+                                  <SelectItem value="__none__">— None —</SelectItem>
+                                  {testRepos.filter((tr) => tr.id !== r.id).map((tr) => (
+                                    <SelectItem key={tr.id} value={tr.id}>{tr.repo_url.split("/").slice(-1)[0].replace(".git", "")}</SelectItem>
+                                  ))}
+                                </SelectContent>
+                              </Select>
+                            ) : (
+                              <span className="text-xs text-slate-400">—</span>
+                            )}
+                          </TableCell>
                           <TableCell>
                             <Badge variant="outline" className="text-slate-600 border-slate-300">
                               {r.provider}
                             </Badge>
                           </TableCell>
-                          <TableCell className="text-xs text-slate-600">{t ? t.name : "(missing token)"}</TableCell>
-                          <TableCell className="text-xs text-slate-600">{r.status}</TableCell>
-                          <TableCell className="text-xs text-slate-600">{r.last_synced_at || "—"}</TableCell>
+                          <TableCell className="text-xs text-slate-600">{r.status}{r.last_synced_at ? ` • ${r.last_synced_at.split("T")[0]}` : ""}</TableCell>
                           <TableCell className="text-right space-x-2">
                             <Button variant="outline" size="sm" onClick={() => syncRepo(r.id)}>
                               Sync

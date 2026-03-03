@@ -1,8 +1,10 @@
-import axios from 'axios';
+import { createApiClient } from './httpClient';
 
 // jsconfig.json enables checkJs; cast import.meta to any for Vite env access.
 const viteEnv = /** @type {any} */ (import.meta).env;
 const GENERATOR_URL = viteEnv?.VITE_GENERATOR_URL || 'http://localhost:8003';
+
+const client = createApiClient(GENERATOR_URL);
 
 const knowledgeGraphAPI = {
   /**
@@ -10,7 +12,7 @@ const knowledgeGraphAPI = {
    * @returns {Promise<Array>}
    */
   list: async () => {
-    const res = await axios.get(`${GENERATOR_URL}/knowledge-graphs`);
+    const res = await client.get('/knowledge-graphs');
     return res.data;
   },
 
@@ -20,7 +22,7 @@ const knowledgeGraphAPI = {
    * @returns {Promise<Object>}
    */
   get: async (id) => {
-    const res = await axios.get(`${GENERATOR_URL}/knowledge-graphs/${id}`);
+    const res = await client.get(`/knowledge-graphs/${id}`);
     return res.data;
   },
 
@@ -30,7 +32,7 @@ const knowledgeGraphAPI = {
    * @returns {Promise<Object>}
    */
   create: async (data) => {
-    const res = await axios.post(`${GENERATOR_URL}/knowledge-graphs`, data);
+    const res = await client.post('/knowledge-graphs', data);
     return res.data;
   },
 
@@ -41,7 +43,7 @@ const knowledgeGraphAPI = {
    * @returns {Promise<Object>}
    */
   update: async (id, data) => {
-    const res = await axios.put(`${GENERATOR_URL}/knowledge-graphs/${id}`, data);
+    const res = await client.put(`/knowledge-graphs/${id}`, data);
     return res.data;
   },
 
@@ -51,7 +53,7 @@ const knowledgeGraphAPI = {
    * @returns {Promise<Object>}
    */
   delete: async (id) => {
-    const res = await axios.delete(`${GENERATOR_URL}/knowledge-graphs/${id}`);
+    const res = await client.delete(`/knowledge-graphs/${id}`);
     return res.data;
   },
 };

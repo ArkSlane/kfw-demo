@@ -47,6 +47,14 @@ export function createApiClient(baseURL) {
   return _addInterceptor(client);
 }
 
+/**
+ * Return the current access-token string (or null).
+ * Useful for non-axios calls (e.g. raw fetch / SSE streams).
+ */
+export function getAuthToken() {
+  return _getToken();
+}
+
 let _globalSetup = false;
 
 /**

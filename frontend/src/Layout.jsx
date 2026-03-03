@@ -1,7 +1,7 @@
 import React from "react";
 import { Link, useLocation } from "react-router-dom";
 import { createPageUrl } from "@/utils";
-import { ClipboardList, FileText, ClipboardCheck, Bot, Menu, Package, PlayCircle, Sparkles, LogOut, User, Shield } from "lucide-react";
+import { ClipboardList, FileText, ClipboardCheck, Bot, Menu, Package, PlayCircle, Sparkles, LogOut, User, Shield, Crosshair, Download, GitMerge } from "lucide-react";
 import {
   Sidebar,
   SidebarContent,
@@ -64,6 +64,21 @@ const navigationItems = [
     title: "Executions",
     url: createPageUrl("Executions"),
     icon: PlayCircle,
+  },
+  {
+    title: "Locators",
+    url: createPageUrl("Locators"),
+    icon: Crosshair,
+  },
+  {
+    title: "Extract Requirements",
+    url: createPageUrl("extract-requirements"),
+    icon: Download,
+  },
+  {
+    title: "MR Pipeline",
+    url: createPageUrl("mr-pipeline"),
+    icon: GitMerge,
   },
 ];
 
