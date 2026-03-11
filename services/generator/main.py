@@ -56,6 +56,37 @@ APP_KNOWLEDGE_GRAPH: dict = {
     "app_name": "TestMaster",
     "framework": "React + Vite + shadcn/ui (Tailwind)",
     "base_url_docker": "http://frontend:5173",
+    "auth": {
+        "type": "Keycloak SSO (OpenID Connect)",
+        "description": (
+            "The app uses Keycloak for authentication. When an unauthenticated user "
+            "navigates to any page, the browser is REDIRECTED to the Keycloak login page. "
+            "After successful login, Keycloak redirects back to the app."
+        ),
+        "login_flow": [
+            "1. Navigate to http://frontend:5173 (any page triggers login redirect)",
+            "2. Browser is redirected to Keycloak login page (http://keycloak:8080/realms/testmaster/...)",
+            "3. Fill in username and password on the Keycloak form",
+            "4. Click the login button",
+            "5. Browser is redirected back to the app (authenticated)",
+        ],
+        "keycloak_login_selectors": {
+            "username_field": "input#username  (use page.locator('#username'))",
+            "password_field": "input#password  (use page.locator('#password'))",
+            "login_button": "input#kc-login or button#kc-login  (use page.locator('#kc-login'))",
+        },
+        "test_credentials": {
+            "admin": {"username": "admin", "password": "admin123"},
+            "editor": {"username": "editor", "password": "editor123"},
+            "viewer": {"username": "viewer", "password": "viewer123"},
+        },
+        "important_notes": (
+            "Login is handled AUTOMATICALLY before your script runs. "
+            "Do NOT write any login/authentication code. "
+            "Your script starts ALREADY LOGGED IN on the TestPlan dashboard. "
+            "Just navigate directly to the page you need to test."
+        ),
+    },
     "selector_strategy": (
         "No data-testid attributes exist. "
         "Use role-based selectors: page.getByRole('button', {name:'...'}), page.getByRole('link', {name:'...'}), page.getByRole('heading', {name:'...'}). "
@@ -180,8 +211,31 @@ def _build_knowledge_graph_prompt_block(steps_text: str = "", kg: dict | None = 
         f"Docker base URL: {kg['base_url_docker']}",
         f"Selector strategy: {kg['selector_strategy']}",
         "",
-        "Sidebar navigation links (use page.getByRole('link', {{name: '<label>'}}) to click):",
     ]
+
+    # Include authentication/login info if present
+    auth = kg.get("auth")
+    if auth:
+        lines.append("=== AUTHENTICATION (Keycloak SSO) ===")
+        lines.append(auth.get("description", ""))
+        lines.append("Login flow:")
+        for step in auth.get("login_flow", []):
+            lines.append(f"  {step}")
+        selectors = auth.get("keycloak_login_selectors", {})
+        if selectors:
+            lines.append("Keycloak login form selectors:")
+            for field, sel in selectors.items():
+                lines.append(f"  - {field}: {sel}")
+        creds = auth.get("test_credentials", {})
+        if creds:
+            first_user = next(iter(creds.values()), {})
+            lines.append(f"Test credentials: username='{first_user.get('username', '')}', password='{first_user.get('password', '')}'")
+        if auth.get("important_notes"):
+            lines.append(f"IMPORTANT: {auth['important_notes']}")
+        lines.append("=== END AUTHENTICATION ===")
+        lines.append("")
+
+    lines.append("Sidebar navigation links (use page.getByRole('link', {{name: '<label>'}}) to click):")
     for item in kg["layout"]["sidebar"]["nav_items"]:
         lines.append(f"  - '{item['label']}' → {item['route']}")
     lines.append(f"  - 'Admin' → /admin  (sidebar footer)")
@@ -405,8 +459,43 @@ async def _execute_script_with_retries(client: httpx.AsyncClient, script: str, v
     Returns the parsed JSON response from the MCP execute endpoint.
     """
     url = f"{PLAYWRIGHT_MCP_URL}/execute"
+
+    # Prepend route interceptors to remap localhost URLs to Docker-internal hostnames,
+    # plus an automatic Keycloak login helper that scripts can rely on.
+    # This is necessary because the frontend's Keycloak config uses localhost:8080,
+    # but the Playwright browser runs inside Docker where localhost != host machine.
+    route_prefix = (
+        "// Route interceptors: remap localhost URLs to Docker-internal hostnames\n"
+        "await page.route('**localhost:8080/**', async route => {\n"
+        "  const url = route.request().url().replace('localhost:8080', 'keycloak:8080');\n"
+        "  await route.continue({ url });\n"
+        "});\n"
+        "await page.route('**localhost:5173/**', async route => {\n"
+        "  const url = route.request().url().replace('localhost:5173', 'frontend:5173');\n"
+        "  await route.continue({ url });\n"
+        "});\n"
+        "\n"
+        "// Auto-login via Keycloak if needed\n"
+        "async function ensureKeycloakLogin(pg, user = 'admin', pass = 'admin123') {\n"
+        "  await pg.goto('http://frontend:5173/');\n"
+        "  await pg.waitForTimeout(3000);\n"
+        "  // Check if we're on the Keycloak login page\n"
+        "  const isKeycloak = await pg.locator('#username').count() > 0;\n"
+        "  if (isKeycloak) {\n"
+        "    await pg.locator('#username').fill(user);\n"
+        "    await pg.locator('#password').fill(pass);\n"
+        "    await pg.locator('#kc-login').click();\n"
+        "    await pg.waitForURL('**/TestPlan**', { timeout: 15000 }).catch(() => {});\n"
+        "    await pg.waitForLoadState('networkidle');\n"
+        "  }\n"
+        "}\n"
+        "await ensureKeycloakLogin(page);\n"
+        "\n"
+    )
+    prepared_script = route_prefix + script
+
     payload = {
-        "script": script,
+        "script": prepared_script,
         "record_video": bool(record_video),
     }
     if video_filename:
@@ -564,6 +653,11 @@ async def _repair_and_rerun(
             "You are an expert Playwright automation engineer. A script was executed and failed. "
             "Return ONLY the corrected JavaScript code (no markdown, no fences, no explanation). "
             "The returned code should be the full test body to be executed inside `async (page) => { ... }` and should use `await page.*` statements.\n\n"
+            "AUTHENTICATION IS ALREADY HANDLED — DO NOT ADD LOGIN CODE:\n"
+            "- The user is ALREADY LOGGED IN when the script starts.\n"
+            "- Do NOT write ANY login/authentication code (no username/password filling).\n"
+            "- Do NOT navigate to any login page.\n"
+            "- The script starts on the TestPlan dashboard.\n\n"
             "CRITICAL RULES:\n"
             "- Use Playwright locator APIs: page.locator(), page.getByRole(), page.getByText(), page.getByLabel().\n"
             "- NEVER use page.evaluate() to inspect DOM elements or read className/attributes.\n"
@@ -1471,14 +1565,27 @@ class GenerateTestSuiteResponse(BaseModel):
 
 
 def _strip_markdown_code_fences(text: str) -> str:
+    """Extract code from the first markdown code block, discarding trailing commentary.
+
+    Handles cases where the LLM returns code inside fences followed by
+    explanatory markdown text (e.g. "### Notes on Implementation: ...").
+    """
     t = (text or "").strip()
     if not t.startswith("```"):
+        # No opening fence — check if there's a code block embedded
+        m = re.search(r"```[\w]*\n([\s\S]*?)```", t)
+        if m:
+            return m.group(1).strip()
         return t
     lines = t.split("\n")
-    lines = lines[1:]
-    if lines and lines[-1].strip().startswith("```"):
-        lines = lines[:-1]
-    return "\n".join(lines).strip()
+    lines = lines[1:]  # skip opening fence line
+    # Find the FIRST closing fence (not the last line)
+    code_lines = []
+    for line in lines:
+        if line.strip().startswith("```"):
+            break
+        code_lines.append(line)
+    return "\n".join(code_lines).strip()
 
 
 def _extract_first_json_object(text: str) -> str | None:
@@ -1780,6 +1887,23 @@ def _unwrap_playwright_script_to_page_only(script: str) -> str:
 
     text = _strip_markdown_code_fences(text).strip()
 
+    # Strip require/import lines that don't execute inside MCP
+    text = re.sub(
+        r"^\s*(?:const|let|var)\s+\{[^}]*\}\s*=\s*require\s*\([^)]*\)\s*;?\s*\n?",
+        "",
+        text,
+        flags=re.MULTILINE,
+    ).strip()
+
+    # Unwrap Playwright Test wrapper: test('title', async ({ page }) => { ... });
+    m = re.match(
+        r"^\s*test\s*\(\s*['\"].*?['\"]\s*,\s*async\s*\(\s*\{\s*page\s*\}\s*\)\s*=>\s*\{([\s\S]*)\}\s*\)\s*;?\s*$",
+        text,
+        re.IGNORECASE,
+    )
+    if m:
+        text = (m.group(1) or "").strip()
+
     # Unwrap a few common wrappers the LLM sometimes adds.
     for _ in range(0, 3):
         m = re.search(
@@ -1814,6 +1938,16 @@ def _unwrap_playwright_script_to_page_only(script: str) -> str:
         # async function(page) { ... }  (no invocation)
         m = re.match(
             r"^\s*async\s+function\s*\(\s*page\s*\)\s*\{([\s\S]*)\}\s*;?\s*$",
+            text,
+            re.IGNORECASE,
+        )
+        if m:
+            text = (m.group(1) or "").strip()
+            continue
+
+        # Named async function: async function someName() { ... }  (no page param)
+        m = re.match(
+            r"^\s*async\s+function\s+\w+\s*\([^)]*\)\s*\{([\s\S]*)\}\s*;?\s*$",
             text,
             re.IGNORECASE,
         )
@@ -1862,6 +1996,13 @@ async def _generate_playwright_script_single_call(
         "The code will be inserted inside `async (page) => { ... }` and executed via Playwright MCP.\n",
         "Only `page` is guaranteed to exist. Do NOT reference `context` or `browser`.\n",
         "Do NOT wrap your code in any function/IIFE.\n\n",
+        "AUTHENTICATION IS ALREADY HANDLED — SKIP ALL LOGIN STEPS:\n",
+        "- The user is ALREADY LOGGED IN when your script starts.\n",
+        "- Do NOT write ANY login/authentication code.\n",
+        "- Do NOT navigate to any login page or fill username/password fields.\n",
+        "- If a test step says 'log in' or 'sign in', SKIP that step entirely.\n",
+        "- Your script starts on the TestPlan dashboard (http://frontend:5173/TestPlan).\n",
+        "- Just navigate to the page you need to test using page.goto() or sidebar links.\n\n",
         "CRITICAL RULES:\n",
         "- Use page.getByRole(), page.getByText(), page.getByLabel(), page.locator() — NEVER page.evaluate().\n",
         "- SVG elements have no string className.\n",
