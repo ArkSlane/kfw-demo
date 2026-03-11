@@ -42,6 +42,7 @@ AUTOMATIONS_URL = os.getenv("AUTOMATIONS_SERVICE_URL", "http://automations:8000"
 PLAYWRIGHT_MCP_URL = os.getenv("PLAYWRIGHT_MCP_URL", "http://playwright-mcp-agent:3000")
 OLLAMA_MCP_AGENT_URL = os.getenv("OLLAMA_MCP_AGENT_URL", "http://ollama-mcp-agent:3000")
 RELEASES_URL = os.getenv("RELEASES_SERVICE_URL", "http://localhost:8004")
+ORCHESTRATOR_URL = os.getenv("ORCHESTRATOR_SERVICE_URL", "http://orchestrator:8000")
 
 # ---------------------------------------------------------------------------
 # App Knowledge Graph — static map of the frontend UI for LLM context
@@ -450,6 +451,84 @@ async def _ollama_generate_request(client: httpx.AsyncClient, prompt: str, extra
     return resp.json()
 
 
+def _dynamic_max_retries(exec_error: str | None) -> int:
+    """Choose retry budget based on the type of error encountered.
+
+    - Selector/timeout errors are likely fixable → more retries
+    - Assertion failures may be real bugs → fewer retries
+    - Syntax errors in generated code → moderate retries
+    """
+    if not exec_error:
+        return 2
+    err = exec_error.lower()
+    # Real application bugs — don't waste retries
+    if any(kw in err for kw in ("assertion", "expect(", "tobetruthy", "tobevisible")):
+        return 1
+    # Selector issues — likely fixable by the LLM
+    if any(kw in err for kw in ("selector", "locator", "not found", "getbyrole", "getbytext", "getbylabel")):
+        return 3
+    # Timeout — could be app slowness or wrong selector
+    if "timeout" in err:
+        return 2
+    # Navigation failures — worth a couple retries
+    if any(kw in err for kw in ("navigation", "about:blank", "goto")):
+        return 2
+    return 2
+
+
+async def _fetch_memory_prompt_block(client: httpx.AsyncClient, page: str | None = None) -> str:
+    """Fetch learned insights from the orchestrator's agent memory.
+
+    Returns a prompt block string to inject into LLM prompts, or empty string on failure.
+    """
+    try:
+        params = {}
+        if page:
+            params["page"] = page
+        resp = await client.get(f"{ORCHESTRATOR_URL}/memory/prompt-block", params=params, timeout=5)
+        if resp.status_code == 200:
+            return resp.json().get("prompt_block", "")
+    except Exception:
+        pass
+    return ""
+
+
+async def _report_outcome_to_orchestrator(
+    client: httpx.AsyncClient,
+    *,
+    test_case_id: str,
+    requirement_id: str | None = None,
+    first_try_success: bool,
+    repair_attempts: int,
+    final_success: bool,
+    error_type: str | None = None,
+    duration_ms: int | None = None,
+    page: str | None = None,
+    generation_mode: str = "unknown",
+) -> None:
+    """Report a generation outcome to the orchestrator for persistent learning."""
+    try:
+        await client.post(
+            f"{ORCHESTRATOR_URL}/memory/record-outcome",
+            json={
+                "test_case_id": test_case_id,
+                "requirement_id": requirement_id,
+                "model": OLLAMA_MODEL,
+                "generation_mode": generation_mode,
+                "first_try_success": first_try_success,
+                "repair_attempts": repair_attempts,
+                "final_success": final_success,
+                "error_type": error_type,
+                "duration_ms": duration_ms,
+                "page": page,
+            },
+            timeout=5,
+        )
+    except Exception:
+        # Best-effort — don't let memory failures block generation
+        pass
+
+
 async def _repair_and_rerun(
     client: httpx.AsyncClient,
     original_script: str,
@@ -464,13 +543,21 @@ async def _repair_and_rerun(
 ) -> tuple[str, dict | None, int]:
     """Attempt to repair a failing Playwright script by calling the LLM with the error log.
 
+    Uses dynamic retry limits based on error type and injects learnings from
+    the agent memory into the repair prompt.
+
     Returns: (final_script, exec_data_or_none, attempts_made)
     """
+    # Dynamic retry: override max_retries based on the error type
+    max_retries = _dynamic_max_retries(exec_error)
     last_exec: dict | None = None
     current_script = original_script or ""
 
     # Build knowledge-graph block once (uses the script itself to guess relevant pages)
     kg_block = _build_knowledge_graph_prompt_block(current_script, kg=kg)
+
+    # Fetch learnings from agent memory (best-effort)
+    memory_block = await _fetch_memory_prompt_block(client)
 
     for attempt in range(1, max_retries + 1):
         prompt = (
@@ -495,6 +582,12 @@ async def _repair_and_rerun(
                 "=== APP KNOWLEDGE GRAPH (routes, buttons, selectors) ===\n"
                 f"{kg_block}\n"
                 "=== END KNOWLEDGE GRAPH ===\n\n"
+            )
+        if memory_block:
+            prompt += (
+                "=== LEARNINGS FROM PAST EXECUTIONS ===\n"
+                f"{memory_block}\n"
+                "=== END LEARNINGS ===\n\n"
             )
         prompt += f"Original script:\n{current_script}\n\n"
         if exec_error:
@@ -1759,6 +1852,9 @@ async def _generate_playwright_script_single_call(
     steps_text = format_steps_for_mcp(steps)
     kg_block = _build_knowledge_graph_prompt_block(steps_text, kg=kg)
 
+    # Fetch learnings from agent memory (best-effort, non-blocking on failure)
+    memory_block = await _fetch_memory_prompt_block(client)
+
     prompt = "".join([
         "You are an expert Playwright automation engineer.\n",
         "Generate a COMPLETE Playwright script for ALL of the test steps below in ONE output.\n",
@@ -1789,6 +1885,7 @@ async def _generate_playwright_script_single_call(
         "=== APPLICATION KNOWLEDGE GRAPH ===\n",
         kg_block, "\n",
         "=== END KNOWLEDGE GRAPH ===\n\n",
+        *([f"=== LEARNINGS FROM PAST EXECUTIONS ===\n{memory_block}\n=== END LEARNINGS ===\n\n"] if memory_block else []),
         f"Test Case: {test_case_title}\n",
         f"Description: {description or 'N/A'}\n",
         f"Preconditions: {preconditions or 'N/A'}\n",
@@ -2235,6 +2332,19 @@ async def generate_automation_from_execution(payload: ExecutionGenerateRequest, 
         save_resp = await client.post(f"{AUTOMATIONS_URL}/automations", json=automation_data)
         save_resp.raise_for_status()
         saved = save_resp.json()
+
+        # Report outcome to orchestrator for persistent learning
+        first_try = exec_success and repair_attempts == 0
+        await _report_outcome_to_orchestrator(
+            client,
+            test_case_id=payload.test_case_id,
+            requirement_id=test_case.get("requirement_id"),
+            first_try_success=first_try,
+            repair_attempts=repair_attempts,
+            final_success=exec_success,
+            error_type=exec_error[:200] if exec_error and not exec_success else None,
+            generation_mode=generation_metadata.get("generation_mode", "step_by_step"),
+        )
 
         return ExecutionAutomationOut(
             automation_id=saved.get("id"),

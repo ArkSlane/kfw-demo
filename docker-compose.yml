@@ -84,6 +84,7 @@ services:
       - testcase-migration
       - toabrkia
       - git
+      - orchestrator
     networks:
       - app-network
 
@@ -143,6 +144,7 @@ services:
       OLLAMA_MCP_AGENT_URL: http://ollama-mcp-agent:3000
       AUTOMATIONS_SERVICE_URL: http://automations:8000
       PLAYWRIGHT_MCP_URL: http://playwright-mcp-agent:3000
+      ORCHESTRATOR_SERVICE_URL: http://orchestrator:8000
       <<: *shared-env
     ports:
       - "8003:8000"
@@ -203,6 +205,30 @@ services:
       <<: *shared-env
     ports:
       - "8008:8000"
+    restart: unless-stopped
+    depends_on:
+      - mongo
+      - redis
+      - keycloak
+    networks:
+      - app-network
+
+  orchestrator:
+    build:
+      context: .
+      dockerfile: services/orchestrator/Dockerfile
+    environment:
+      MONGO_URL: mongodb://mongo:27017
+      DB_NAME: aitp
+      REQUIREMENTS_SERVICE_URL: http://requirements:8000
+      TESTCASES_SERVICE_URL: http://testcases:8000
+      GENERATOR_SERVICE_URL: http://generator:8000
+      RELEASES_SERVICE_URL: http://releases:8000
+      AUTOMATIONS_SERVICE_URL: http://automations:8000
+      EXECUTIONS_SERVICE_URL: http://executions:8000
+      <<: *shared-env
+    ports:
+      - "8010:8000"
     restart: unless-stopped
     depends_on:
       - mongo
