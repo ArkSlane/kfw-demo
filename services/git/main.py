@@ -1594,3 +1594,216 @@ async def delete_llm_connection(connection_id: str):
     llm_connections_store.delete(connection_id)
     return {"id": connection_id, "deleted": True}
 
+
+# === Requirement Extraction from Code ===
+
+# File extensions relevant for requirement extraction (source code, config, docs)
+_CODE_EXTENSIONS = {
+    ".py", ".js", ".jsx", ".ts", ".tsx", ".vue", ".svelte",
+    ".java", ".kt", ".cs", ".go", ".rs", ".rb", ".php",
+    ".html", ".htm", ".css", ".scss",
+    ".md", ".txt", ".rst", ".yaml", ".yml", ".json", ".toml",
+}
+_MAX_CODE_FILE_SIZE = 80_000  # ~80 KB per file
+_MAX_TOTAL_CONTENT = 120_000  # truncate combined content sent to LLM
+_SKIP_DIRS = {"node_modules", "dist", "build", ".next", "__pycache__", ".git", "vendor", ".venv", "venv", "coverage", ".nyc_output"}
+
+
+class ExtractRequirementsRequest(BaseModel):
+    connection_id: str
+    path: str | None = None
+    file_extensions: list[str] | None = None  # e.g. [".py", ".tsx"] — if set, only these extensions
+    max_files: int = 60
+
+
+class ExtractedRequirement(BaseModel):
+    title: str
+    description: str
+    tags: list[str] = []
+    source_files: list[str] = []
+    confidence: str = "medium"  # low / medium / high
+
+
+def _collect_code_files(
+    root: Path,
+    sub_path: str | None = None,
+    extensions: set[str] | None = None,
+    max_files: int = 60,
+) -> list[Path]:
+    """Walk a repo directory and collect source files for analysis."""
+    if sub_path:
+        sub_path = sub_path.strip("/").strip("\\")
+    base = root / sub_path if sub_path else root
+    if not base.exists():
+        raise HTTPException(status_code=404, detail=f"Path not found in repo: {sub_path or '/'}")
+    allowed = extensions or _CODE_EXTENSIONS
+    files: list[Path] = []
+    for p in sorted(base.rglob("*")):
+        if not p.is_file():
+            continue
+        if p.suffix.lower() not in allowed:
+            continue
+        rel = str(p.relative_to(root))
+        if any(part.startswith(".") or part in _SKIP_DIRS for part in rel.split(os.sep)):
+            continue
+        if p.stat().st_size > _MAX_CODE_FILE_SIZE:
+            continue
+        files.append(p)
+        if len(files) >= max_files:
+            break
+    return files
+
+
+async def _call_llm_for_requirements(file_summaries: str) -> list[dict]:
+    """Send code summaries to Azure OpenAI and extract requirements."""
+    if not AZURE_OPENAI_ENDPOINT or not AZURE_OPENAI_API_KEY:
+        raise HTTPException(status_code=500, detail="Azure OpenAI not configured")
+
+    prompt = (
+        "You are a senior QA and requirements engineer. Analyze the following source code files "
+        "and extract testable software requirements from them.\n\n"
+        "For each requirement:\n"
+        "- Write a clear, concise title (max 120 chars)\n"
+        "- Write a description explaining what the software should do and why it's testable\n"
+        "- Add relevant tags (e.g. 'authentication', 'api', 'ui', 'validation', 'navigation')\n"
+        "- List the source files that evidence this requirement\n"
+        "- Rate confidence: 'high' if clearly implemented, 'medium' if inferred, 'low' if uncertain\n\n"
+        "Focus on:\n"
+        "- User-facing features and interactions\n"
+        "- API endpoints and their expected behavior\n"
+        "- Form validations \n"
+        "- Authentication and authorization flows\n"
+        "- Navigation and routing\n"
+        "- Data display and CRUD operations\n"
+        "- Error handling visible to users\n\n"
+        "Do NOT extract:\n"
+        "- Internal implementation details\n"
+        "- Build/config requirements\n"
+        "- Code style or formatting\n\n"
+        "Return a JSON object with a single key 'requirements' containing an array of objects, each with:\n"
+        '  {"title": "...", "description": "...", "tags": [...], "source_files": [...], "confidence": "high|medium|low"}\n\n'
+        "Extract between 5 and 30 requirements depending on the codebase size.\n\n"
+        "=== SOURCE CODE FILES ===\n\n"
+        + file_summaries
+    )
+
+    url = (
+        f"{AZURE_OPENAI_ENDPOINT.rstrip('/')}/openai/deployments/"
+        f"{AZURE_OPENAI_DEPLOYMENT}/chat/completions?api-version={AZURE_OPENAI_API_VERSION}"
+    )
+    payload = {
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.2,
+        "top_p": 1,
+        "response_format": {"type": "json_object"},
+    }
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            url,
+            json=payload,
+            headers={"api-key": AZURE_OPENAI_API_KEY, "Content-Type": "application/json"},
+            timeout=120,
+        )
+        resp.raise_for_status()
+        body = resp.json()
+
+    raw = (body.get("choices", [{}])[0].get("message", {}).get("content", "")).strip()
+    if not raw:
+        return []
+
+    try:
+        data = _json.loads(raw)
+        return data.get("requirements", [])
+    except _json.JSONDecodeError:
+        logger.warning("LLM returned invalid JSON for requirement extraction")
+        return []
+
+
+@app.post(
+    "/extract-requirements",
+    tags=["requirements"],
+    summary="Extract requirements from code",
+    description="""Analyze source code in a connected repository using AI to extract
+testable software requirements. The AI reads source files and identifies features,
+behaviors, and interactions that can be turned into test cases.
+
+Streams results as newline-delimited JSON:
+  - `{"type":"progress", ...}` — file scanning progress
+  - `{"type":"requirements", ...}` — extracted requirements
+  - `{"type":"error", ...}` — if extraction fails
+""",
+)
+async def extract_requirements_from_code(payload: ExtractRequirementsRequest):
+    conn = repo_connections_store.get(payload.connection_id)
+    repo_root = WORKSPACE_DIR / conn.repo_path
+    if not repo_root.exists():
+        raise HTTPException(status_code=404, detail="Repository checkout not found on disk")
+
+    extensions = None
+    if payload.file_extensions:
+        extensions = {ext if ext.startswith(".") else f".{ext}" for ext in payload.file_extensions}
+
+    files = _collect_code_files(repo_root, payload.path, extensions, payload.max_files)
+    if not files:
+        raise HTTPException(status_code=404, detail="No source files found matching criteria")
+
+    async def _stream():
+        # Progress: scanning files
+        yield _json.dumps({
+            "type": "progress",
+            "stage": "scanning",
+            "message": f"Found {len(files)} source files to analyze",
+            "total_files": len(files),
+        }) + "\n"
+
+        # Read file contents and build summaries for LLM
+        file_summaries_parts = []
+        total_chars = 0
+        files_read = 0
+
+        for f in files:
+            try:
+                content = f.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+
+            rel_path = str(f.relative_to(repo_root)).replace("\\", "/")
+            # Truncate individual file if needed
+            if len(content) > 8000:
+                content = content[:8000] + "\n... (truncated)"
+            summary = f"--- FILE: {rel_path} ---\n{content}\n"
+
+            if total_chars + len(summary) > _MAX_TOTAL_CONTENT:
+                break
+
+            file_summaries_parts.append(summary)
+            total_chars += len(summary)
+            files_read += 1
+
+        yield _json.dumps({
+            "type": "progress",
+            "stage": "analyzing",
+            "message": f"Sending {files_read} files to AI for analysis...",
+            "files_read": files_read,
+        }) + "\n"
+
+        # Call LLM
+        try:
+            requirements = await _call_llm_for_requirements("\n".join(file_summaries_parts))
+            yield _json.dumps({
+                "type": "requirements",
+                "requirements": requirements,
+                "total": len(requirements),
+                "files_analyzed": files_read,
+                "repo_url": conn.repo_url,
+            }) + "\n"
+        except Exception as exc:
+            logger.error("Requirement extraction failed: %s", exc)
+            yield _json.dumps({
+                "type": "error",
+                "message": f"AI analysis failed: {exc}",
+            }) + "\n"
+
+    return StreamingResponse(_stream(), media_type="application/x-ndjson")
+
