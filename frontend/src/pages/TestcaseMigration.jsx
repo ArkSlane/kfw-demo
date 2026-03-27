@@ -14,7 +14,7 @@ import { Input } from "@/components/ui/input";
 
 // jsconfig.json enables checkJs; cast import.meta to any for Vite env access.
 const viteEnv = /** @type {any} */ (import.meta).env;
-const GENERATOR_URL = viteEnv?.VITE_GENERATOR_URL || "http://localhost:8003";
+const GENERATOR_URL = viteEnv?.VITE_GENERATOR_URL || "http://localhost:8013";
 
 const steps = [
   { id: 1, title: "Paste code" },

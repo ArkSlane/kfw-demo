@@ -1,5 +1,5 @@
 x-shared-env: &shared-env
-  AUTH_ENABLED: "true"
+  AUTH_ENABLED: "false"
   AUTH_MODE: keycloak
   AUTH_KEYCLOAK_URL: http://keycloak:8080
   AUTH_KEYCLOAK_REALM: testmaster
@@ -135,16 +135,18 @@ services:
       REQUIREMENTS_SERVICE_URL: http://requirements:8000
       TESTCASES_SERVICE_URL: http://testcases:8000
       RELEASES_SERVICE_URL: http://releases:8000
-      OLLAMA_URL: http://ollama:11434
-      OLLAMA_MODEL: qwen3:14b
-      OLLAMA_TEMPERATURE: "0"
-      OLLAMA_TOP_P: "1"
-      OLLAMA_MAX_TOKENS: "2048"
+      AZURE_OPENAI_ENDPOINT: ${AZURE_OPENAI_ENDPOINT}
+      AZURE_OPENAI_API_KEY: ${AZURE_OPENAI_API_KEY}
+      AZURE_OPENAI_API_VERSION: ${AZURE_OPENAI_API_VERSION:-2024-12-01-preview}
+      AZURE_OPENAI_DEPLOYMENT: ${AZURE_OPENAI_DEPLOYMENT:-gpt-4o}
+      LLM_TEMPERATURE: ${LLM_TEMPERATURE:-0}
+      LLM_TOP_P: ${LLM_TOP_P:-1}
+      LLM_MAX_TOKENS: ${LLM_MAX_TOKENS:-8192}
       REJECT_INVALID_GENERATIONS: "true"
-      OLLAMA_MCP_AGENT_URL: http://ollama-mcp-agent:3000
       AUTOMATIONS_SERVICE_URL: http://automations:8000
       PLAYWRIGHT_MCP_URL: http://playwright-mcp-agent:3000
       ORCHESTRATOR_SERVICE_URL: http://orchestrator:8000
+      PINCHTAB_URL: http://pinchtab:9867
       <<: *shared-env
     ports:
       - "8003:8000"
@@ -155,7 +157,7 @@ services:
       - keycloak
       - requirements
       - testcases
-      - ollama
+      - pinchtab
     networks:
       - app-network
 
@@ -245,12 +247,14 @@ services:
       TESTCASES_SERVICE_URL: http://testcases:8000
       GENERATOR_SERVICE_URL: http://generator:8000
       AUTOMATIONS_SERVICE_URL: http://automations:8000
-      OLLAMA_URL: http://ollama:11434
-      OLLAMA_MODEL: qwen3:14b
+      AZURE_OPENAI_ENDPOINT: ${AZURE_OPENAI_ENDPOINT}
+      AZURE_OPENAI_API_KEY: ${AZURE_OPENAI_API_KEY}
+      AZURE_OPENAI_API_VERSION: ${AZURE_OPENAI_API_VERSION:-2024-12-01-preview}
+      AZURE_OPENAI_DEPLOYMENT: ${AZURE_OPENAI_DEPLOYMENT:-gpt-4o}
+      LLM_TEMPERATURE: ${LLM_TEMPERATURE:-0}
+      LLM_TOP_P: ${LLM_TOP_P:-1}
+      LLM_MAX_TOKENS: ${LLM_MAX_TOKENS:-8192}
       MIGRATION_REQUIREMENT_ID: unlinked
-      OLLAMA_TEMPERATURE: "0"
-      OLLAMA_TOP_P: "1"
-      OLLAMA_MAX_TOKENS: "2048"
       <<: *shared-env
     ports:
       - "8009:8000"
@@ -259,7 +263,6 @@ services:
       - testcases
       - generator
       - automations
-      - ollama
       - redis
       - keycloak
     networks:
@@ -297,8 +300,10 @@ services:
     environment:
       WORKSPACE_DIR: /workspace
       SSH_KEYS_DIR: /ssh-keys
-      OLLAMA_URL: http://ollama:11434
-      OLLAMA_MODEL: qwen3:14b
+      AZURE_OPENAI_ENDPOINT: ${AZURE_OPENAI_ENDPOINT}
+      AZURE_OPENAI_API_KEY: ${AZURE_OPENAI_API_KEY}
+      AZURE_OPENAI_API_VERSION: ${AZURE_OPENAI_API_VERSION:-2024-12-01-preview}
+      AZURE_OPENAI_DEPLOYMENT: ${AZURE_OPENAI_DEPLOYMENT:-gpt-4o}
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
       GITLAB_TOKEN: ${GITLAB_TOKEN:-}
       AZURE_DEVOPS_TOKEN: ${AZURE_DEVOPS_TOKEN:-}
@@ -315,68 +320,6 @@ services:
       - keycloak
     networks:
       - app-network
-
-  # ── LLM ───────────────────────────────────────────────────────────────
-  ollama:
-    image: ollama/ollama:latest
-    ports:
-      - "11434:11434"
-    volumes:
-      - ollama_data:/root/.ollama
-    command: ["serve"]
-    environment:
-      - NVIDIA_VISIBLE_DEVICES=all
-      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
-      - OLLAMA_VULKAN=0
-    runtime: nvidia
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-    networks:
-      - app-network
-
-  ollama-init:
-    image: ollama/ollama:latest
-    depends_on:
-      - ollama
-    entrypoint: ["/bin/sh", "-c"]
-    command: ["sleep 5 && ollama pull qwen3:14b"]
-    environment:
-      - OLLAMA_HOST=http://ollama:11434
-      - NVIDIA_VISIBLE_DEVICES=all
-      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
-    networks:
-      - app-network
-
-  ollama-mcp-agent:
-    build:
-      context: .
-      dockerfile: services/ollama-mcp-agent/Dockerfile
-    container_name: ollama-mcp-agent
-    ports:
-      - "3002:3000"
-    volumes:
-      - automation_videos:/videos
-    environment:
-      - PORT=3000
-      - OLLAMA_URL=http://ollama:11434
-      - OLLAMA_MODEL=qwen3:14b
-      - OLLAMA_TEMPERATURE=0
-      - OLLAMA_TOP_P=1
-      - OLLAMA_MAX_TOKENS=2048
-      - PLAYWRIGHT_MCP_OFFICIAL_URL=http://playwright-mcp-core-1:8931/mcp
-      - VIDEO_PATH=/videos
-      - MAX_ITERATIONS=12
-      - MAX_TOOL_CALLS_PER_ITERATION=8
-    networks:
-      - app-network
-    restart: unless-stopped
-    depends_on:
-      - ollama
-      - playwright-mcp-core-1
 
   # ── Playwright pool (3 browser instances) ─────────────────────────────
   playwright-mcp-core-1:
@@ -465,7 +408,7 @@ services:
       - playwright-mcp-core-2
       - playwright-mcp-core-3
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/health').then(r=>{if(!r.ok)throw 1;process.exit(0)}).catch(()=>process.exit(1))"]
       interval: 20s
       timeout: 5s
       retries: 3
@@ -499,13 +442,89 @@ services:
     networks:
       - app-network
 
+  # ── v2 Services — LangChain + LangGraph ────────────────────────────
+  orchestrator-v2:
+    build:
+      context: .
+      dockerfile: services/orchestrator-v2/Dockerfile
+    environment:
+      MONGO_URL: mongodb://mongo:27017
+      DB_NAME: aitp
+      REQUIREMENTS_SERVICE_URL: http://requirements:8000
+      TESTCASES_SERVICE_URL: http://testcases:8000
+      GENERATOR_SERVICE_URL: http://generator-v2:8000
+      RELEASES_SERVICE_URL: http://releases:8000
+      AUTOMATIONS_SERVICE_URL: http://automations:8000
+      EXECUTIONS_SERVICE_URL: http://executions:8000
+      <<: *shared-env
+    ports:
+      - "8011:8000"
+    restart: unless-stopped
+    depends_on:
+      - mongo
+      - redis
+    networks:
+      - app-network
+
+  generator-v2:
+    build:
+      context: .
+      dockerfile: services/generator-v2/Dockerfile
+    environment:
+      MONGO_URL: mongodb://mongo:27017
+      DB_NAME: aitp
+      REQUIREMENTS_SERVICE_URL: http://requirements:8000
+      TESTCASES_SERVICE_URL: http://testcases:8000
+      RELEASES_SERVICE_URL: http://releases:8000
+      AZURE_OPENAI_ENDPOINT: ${AZURE_OPENAI_ENDPOINT}
+      AZURE_OPENAI_API_KEY: ${AZURE_OPENAI_API_KEY}
+      AZURE_OPENAI_API_VERSION: ${AZURE_OPENAI_API_VERSION:-2024-12-01-preview}
+      AZURE_OPENAI_DEPLOYMENT: ${AZURE_OPENAI_DEPLOYMENT:-gpt-4o}
+      LLM_TEMPERATURE: ${LLM_TEMPERATURE:-0}
+      LLM_TOP_P: ${LLM_TOP_P:-1}
+      LLM_MAX_TOKENS: ${LLM_MAX_TOKENS:-8192}
+      AUTOMATIONS_SERVICE_URL: http://automations:8000
+      PLAYWRIGHT_MCP_URL: http://playwright-mcp-agent:3000
+      ORCHESTRATOR_SERVICE_URL: http://orchestrator-v2:8000
+      PINCHTAB_URL: http://pinchtab:9867
+      <<: *shared-env
+    ports:
+      - "8013:8000"
+    restart: unless-stopped
+    depends_on:
+      - mongo
+      - redis
+      - requirements
+      - testcases
+      - pinchtab
+    networks:
+      - app-network
+
+  # ── PinchTab — AI browser automation for page analysis ─────────────
+  pinchtab:
+    image: pinchtab/pinchtab:latest
+    container_name: pinchtab
+    ports:
+      - "9867:9867"
+    volumes:
+      - pinchtab_data:/data
+    shm_size: 2g
+    networks:
+      - app-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9867/health"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+
 volumes:
   mongo_data:
-  ollama_data:
   automation_videos:
   git_workspace:
   git_ssh_keys:
   redis_data:
+  pinchtab_data:
 
 networks:
   app-network:

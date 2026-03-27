@@ -12,7 +12,7 @@ import { Collapsible, CollapsibleTrigger, CollapsibleContent } from "@/component
 import { toast } from "sonner";
 import {
   FileText, FileCode2, GitMerge, Loader2, Plus, Check, AlertCircle,
-  ChevronDown, ChevronRight, ExternalLink, Search, Download, Ticket,
+  ChevronDown, ChevronRight, ExternalLink, Search, Download, Ticket, Upload, FileSpreadsheet, X,
 } from "lucide-react";
 import gitRepoConnectionsAPI from "@/api/gitRepoConnectionsClient";
 import { requirementsAPI } from "@/api/requirementsClient";
@@ -46,6 +46,13 @@ export default function ExtractRequirements() {
   const [mrProvider, setMrProvider] = useState("");
   const [mrNumber, setMrNumber] = useState("");
   const [mrLoading, setMrLoading] = useState(false);
+
+  // --- File upload state ---
+  const [uploadedFile, setUploadedFile] = useState(null);
+  const [fileLoading, setFileLoading] = useState(false);
+  const [titleColumn, setTitleColumn] = useState("");
+  const [descriptionColumn, setDescriptionColumn] = useState("");
+  const [detectedColumns, setDetectedColumns] = useState([]);
 
   // --- Load repos ---
   const { data: repos = [] } = useQuery({
@@ -191,6 +198,141 @@ export default function ExtractRequirements() {
     }
   };
 
+  // ─── File upload handlers ──────────────────────────────────────────
+  const ACCEPTED_TYPES = {
+    "text/csv": "csv",
+    "application/vnd.ms-excel": "csv",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+    "application/pdf": "pdf",
+    "application/msword": "doc",
+  };
+
+  const handleFileSelect = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const ext = file.name.split(".").pop().toLowerCase();
+    const allowed = ["csv", "xlsx", "xls", "docx", "doc", "pdf"];
+    if (!allowed.includes(ext)) {
+      toast.error(`Unsupported file type: .${ext}. Supported: ${allowed.join(", ")}`);
+      return;
+    }
+    setUploadedFile(file);
+    setDetectedColumns([]);
+    setTitleColumn("");
+    setDescriptionColumn("");
+    setExtractedRequirements([]);
+    setSelectedForImport(new Set());
+
+    // Auto-detect columns for CSV
+    if (ext === "csv") {
+      const reader = new FileReader();
+      reader.onload = (ev) => {
+        const text = ev.target.result;
+        const firstLine = text.split(/\r?\n/)[0];
+        // Try common delimiters
+        const delimiter = firstLine.includes(";") ? ";" : ",";
+        const cols = firstLine.split(delimiter).map((c) => c.replace(/^"|"$/g, "").trim());
+        if (cols.length > 0) {
+          setDetectedColumns(cols);
+          // Auto-pick common column names
+          const titleMatch = cols.find((c) => /^(title|name|summary|requirement|bezeichnung|anforderung)$/i.test(c));
+          const descMatch = cols.find((c) => /^(description|desc|details|beschreibung|text|body)$/i.test(c));
+          if (titleMatch) setTitleColumn(titleMatch);
+          if (descMatch) setDescriptionColumn(descMatch);
+        }
+      };
+      reader.readAsText(file);
+    }
+  };
+
+  const handleExtractFromFile = async () => {
+    if (!uploadedFile) {
+      toast.error("Please select a file first");
+      return;
+    }
+    setFileLoading(true);
+    setExtractedRequirements([]);
+    setSelectedForImport(new Set());
+
+    const ext = uploadedFile.name.split(".").pop().toLowerCase();
+
+    try {
+      if (ext === "csv") {
+        // Client-side CSV parsing
+        const text = await uploadedFile.text();
+        const lines = text.split(/\r?\n/).filter((l) => l.trim());
+        if (lines.length < 2) {
+          toast.error("CSV file is empty or has no data rows");
+          setFileLoading(false);
+          return;
+        }
+        const delimiter = lines[0].includes(";") ? ";" : ",";
+        const headers = lines[0].split(delimiter).map((h) => h.replace(/^"|"$/g, "").trim());
+        const tCol = titleColumn || headers[0];
+        const dCol = descriptionColumn || (headers.length > 1 ? headers[1] : null);
+        const tIdx = headers.indexOf(tCol);
+        const dIdx = dCol ? headers.indexOf(dCol) : -1;
+
+        if (tIdx === -1) {
+          toast.error(`Title column "${tCol}" not found in CSV headers`);
+          setFileLoading(false);
+          return;
+        }
+
+        const reqs = lines.slice(1).map((line, i) => {
+          const cells = line.split(delimiter).map((c) => c.replace(/^"|"$/g, "").trim());
+          return {
+            id: `file-${i}`,
+            title: cells[tIdx] || `Row ${i + 1}`,
+            description: dIdx >= 0 ? (cells[dIdx] || "") : "",
+            source: "file-import",
+            tags: ["csv"],
+            meta: { filename: uploadedFile.name, row: i + 2 },
+          };
+        }).filter((r) => r.title.trim());
+
+        setExtractedRequirements(reqs);
+        setSelectedForImport(new Set(reqs.map((r) => r.id)));
+        toast.success(`Parsed ${reqs.length} requirement(s) from CSV`);
+      } else {
+        // For xlsx, docx, pdf — send to backend
+        const formData = new FormData();
+        formData.append("file", uploadedFile);
+        if (titleColumn) formData.append("title_column", titleColumn);
+        if (descriptionColumn) formData.append("description_column", descriptionColumn);
+
+        const response = await fetch("http://localhost:8001/requirements/extract-from-file", {
+          method: "POST",
+          body: formData,
+        });
+
+        if (!response.ok) {
+          const err = await response.json().catch(() => ({}));
+          throw new Error(err.detail || `Server error: ${response.status}`);
+        }
+
+        const data = await response.json();
+        const reqs = (data.requirements || []).map((r, i) => ({
+          id: `file-${i}`,
+          title: r.title || `Requirement ${i + 1}`,
+          description: r.description || "",
+          source: "file-import",
+          tags: r.tags || [ext],
+          meta: { filename: uploadedFile.name, ...(r.meta || {}) },
+        }));
+
+        setExtractedRequirements(reqs);
+        setSelectedForImport(new Set(reqs.map((r) => r.id)));
+        toast.success(`Extracted ${reqs.length} requirement(s) from ${ext.toUpperCase()} file`);
+      }
+    } catch (e) {
+      toast.error("File extraction failed: " + e.message);
+    } finally {
+      setFileLoading(false);
+    }
+  };
+
   // ─── Import selected requirements ──────────────────────────────────
   const handleImportSelected = async () => {
     const toImport = extractedRequirements.filter((r) => selectedForImport.has(r.id));
@@ -237,7 +379,7 @@ export default function ExtractRequirements() {
     }
   };
 
-  const isLoading = jiraLoading || codeLoading || mrLoading;
+  const isLoading = jiraLoading || codeLoading || mrLoading || fileLoading;
 
   // ─── Render ────────────────────────────────────────────────────────
   return (
@@ -250,14 +392,17 @@ export default function ExtractRequirements() {
         <div>
           <h1 className="text-2xl font-bold text-slate-900">Extract Requirements</h1>
           <p className="text-sm text-slate-500">
-            Import requirements from Jira, code repositories, or merge requests
+            Import requirements from files, Jira, code repositories, or merge requests
           </p>
         </div>
       </div>
 
       {/* Source tabs */}
-      <Tabs defaultValue="jira" className="w-full">
-        <TabsList className="grid w-full grid-cols-3">
+      <Tabs defaultValue="file" className="w-full">
+        <TabsList className="grid w-full grid-cols-4">
+          <TabsTrigger value="file" className="flex items-center gap-2">
+            <Upload className="w-4 h-4" /> File Import
+          </TabsTrigger>
           <TabsTrigger value="jira" className="flex items-center gap-2">
             <Ticket className="w-4 h-4" /> Jira
           </TabsTrigger>
@@ -268,6 +413,96 @@ export default function ExtractRequirements() {
             <GitMerge className="w-4 h-4" /> Merge Request
           </TabsTrigger>
         </TabsList>
+
+        {/* ── File Upload Tab ──────────────────────────────────── */}
+        <TabsContent value="file">
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-lg flex items-center gap-2">
+                <FileSpreadsheet className="w-5 h-5 text-emerald-600" /> Import from File
+              </CardTitle>
+              <CardDescription>
+                Upload a CSV, Excel (.xlsx), Word (.docx), or PDF file to extract requirements.
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              {/* Drop zone / file input */}
+              <div
+                className="relative border-2 border-dashed rounded-xl p-8 text-center transition-colors hover:border-emerald-400 hover:bg-emerald-50/50"
+                onDragOver={(e) => { e.preventDefault(); e.currentTarget.classList.add("border-emerald-400", "bg-emerald-50/50"); }}
+                onDragLeave={(e) => { e.currentTarget.classList.remove("border-emerald-400", "bg-emerald-50/50"); }}
+                onDrop={(e) => {
+                  e.preventDefault();
+                  e.currentTarget.classList.remove("border-emerald-400", "bg-emerald-50/50");
+                  const file = e.dataTransfer.files?.[0];
+                  if (file) handleFileSelect({ target: { files: [file] } });
+                }}
+              >
+                <input
+                  type="file"
+                  accept=".csv,.xlsx,.xls,.docx,.doc,.pdf"
+                  onChange={handleFileSelect}
+                  className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
+                />
+                <Upload className="w-10 h-10 text-slate-400 mx-auto mb-3" />
+                <p className="text-sm font-medium text-slate-700">Drop a file here or click to browse</p>
+                <p className="text-xs text-slate-400 mt-1">Supported: CSV, Excel (.xlsx), Word (.docx), PDF</p>
+              </div>
+
+              {/* Selected file info */}
+              {uploadedFile && (
+                <div className="flex items-center gap-3 p-3 bg-slate-50 rounded-lg border">
+                  <FileSpreadsheet className="w-5 h-5 text-emerald-600 shrink-0" />
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm font-medium text-slate-800 truncate">{uploadedFile.name}</p>
+                    <p className="text-xs text-slate-500">{(uploadedFile.size / 1024).toFixed(1)} KB</p>
+                  </div>
+                  <Button variant="ghost" size="icon" onClick={() => { setUploadedFile(null); setDetectedColumns([]); setTitleColumn(""); setDescriptionColumn(""); }}>
+                    <X className="w-4 h-4" />
+                  </Button>
+                </div>
+              )}
+
+              {/* Column mapping for CSV/Excel */}
+              {uploadedFile && detectedColumns.length > 0 && (
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 p-4 bg-blue-50/50 rounded-lg border border-blue-100">
+                  <div className="space-y-2">
+                    <Label>Title Column</Label>
+                    <Select value={titleColumn} onValueChange={setTitleColumn}>
+                      <SelectTrigger>
+                        <SelectValue placeholder="Select title column…" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {detectedColumns.map((col) => (
+                          <SelectItem key={col} value={col}>{col}</SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <div className="space-y-2">
+                    <Label>Description Column (optional)</Label>
+                    <Select value={descriptionColumn} onValueChange={setDescriptionColumn}>
+                      <SelectTrigger>
+                        <SelectValue placeholder="Select description column…" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="__none__">— None —</SelectItem>
+                        {detectedColumns.map((col) => (
+                          <SelectItem key={col} value={col}>{col}</SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                </div>
+              )}
+
+              <Button onClick={handleExtractFromFile} disabled={!uploadedFile || fileLoading}>
+                {fileLoading ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : <Search className="w-4 h-4 mr-2" />}
+                Extract Requirements
+              </Button>
+            </CardContent>
+          </Card>
+        </TabsContent>
 
         {/* ── Jira Tab ───────────────────────────────────────────── */}
         <TabsContent value="jira">

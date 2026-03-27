@@ -6,10 +6,11 @@ const client = createApiClient(API_BASE_URL);
 
 export const requirementsAPI = {
   // List all requirements
-  list: async (q = null, limit = 50, skip = 0) => {
+  list: async (q = null, limit = 50, skip = 0, review_status = null) => {
     try {
       const params = { limit, skip };
       if (q) params.q = q;
+      if (review_status) params.review_status = review_status;
       const response = await client.get('/requirements', { params });
       return Array.isArray(response.data) ? response.data : response.data.data || [];
     } catch (error) {
@@ -66,5 +67,17 @@ export const requirementsAPI = {
     } catch (error) {
       return null;
     }
+  },
+
+  // Approve a pending requirement
+  approve: async (requirementId, reviewedBy) => {
+    const response = await client.post(`/requirements/${requirementId}/approve`, null, { params: { reviewed_by: reviewedBy } });
+    return response.data;
+  },
+
+  // Reject a pending requirement
+  reject: async (requirementId, reviewedBy) => {
+    const response = await client.post(`/requirements/${requirementId}/reject`, null, { params: { reviewed_by: reviewedBy } });
+    return response.data;
   },
 };

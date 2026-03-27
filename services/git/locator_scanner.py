@@ -7,8 +7,7 @@ Two core capabilities:
   2. extract_locators_from_code – parse HTML/JSX and pull out every data-testid
      along with its opening-tag markup.
 
-All LLM calls go through the Ollama HTTP API (no pip ``ollama`` package needed)
-so this module works inside the existing async FastAPI service.
+All LLM calls go through the Azure OpenAI API.
 """
 
 from __future__ import annotations
@@ -47,10 +46,12 @@ async def update_code_with_locators(
     code: str,
     file_name: str,
     *,
-    ollama_url: str,
-    ollama_model: str,
+    azure_endpoint: str,
+    azure_api_key: str,
+    azure_api_version: str = "2024-12-01-preview",
+    azure_deployment: str = "gpt-4o",
 ) -> CodeResponse:
-    """Send *code* to Ollama and get back the full file with ``data-testid``
+    """Send *code* to Azure OpenAI and get back the full file with ``data-testid``
     attributes inserted on interactive / important elements.
 
     The prompt instructs the model to:
@@ -82,12 +83,12 @@ async def update_code_with_locators(
         + code
     )
 
+    url = f"{azure_endpoint.rstrip('/')}/openai/deployments/{azure_deployment}/chat/completions?api-version={azure_api_version}"
     payload = {
-        "model": ollama_model,
-        "prompt": prompt,
-        "stream": False,
+        "messages": [{"role": "user", "content": prompt}],
         "temperature": 0,
         "top_p": 1,
+        "response_format": {"type": "json_object"},
     }
 
     last_error: Exception | None = None
@@ -96,34 +97,35 @@ async def update_code_with_locators(
         try:
             async with httpx.AsyncClient() as client:
                 resp = await client.post(
-                    f"{ollama_url}/api/generate",
+                    url,
                     json=payload,
+                    headers={"api-key": azure_api_key, "Content-Type": "application/json"},
                     timeout=300,
                 )
                 resp.raise_for_status()
                 body = resp.json()
-                raw = (body.get("response") or "").strip()
+                raw = (body.get("choices", [{}])[0].get("message", {}).get("content", "")).strip()
 
             if not raw:
                 logger.warning(
-                    "Ollama returned empty response for %s (attempt %d/%d)",
+                    "Azure OpenAI returned empty response for %s (attempt %d/%d)",
                     file_name, attempt + 1, _MAX_RETRIES,
                 )
                 last_error = ValueError(
-                    f"Ollama returned an empty response for {file_name}"
+                    f"Azure OpenAI returned an empty response for {file_name}"
                 )
                 await _backoff(attempt)
                 continue
 
             logger.info(
-                "Ollama responded for %s (attempt %d/%d, %d chars)",
+                "Azure OpenAI responded for %s (attempt %d/%d, %d chars)",
                 file_name, attempt + 1, _MAX_RETRIES, len(raw),
             )
             return _parse_code_response(raw)
 
         except (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError) as exc:
             logger.warning(
-                "Ollama connection issue for %s (attempt %d/%d): %s",
+                "Azure OpenAI connection issue for %s (attempt %d/%d): %s",
                 file_name, attempt + 1, _MAX_RETRIES, exc,
             )
             last_error = exc
@@ -132,7 +134,7 @@ async def update_code_with_locators(
 
         except Exception as exc:
             logger.warning(
-                "Ollama response parse error for %s (attempt %d/%d): %s  raw[:200]=%s",
+                "Azure OpenAI response parse error for %s (attempt %d/%d): %s  raw[:200]=%s",
                 file_name, attempt + 1, _MAX_RETRIES, exc,
                 repr(raw[:200]) if 'raw' in dir() else "N/A",
             )

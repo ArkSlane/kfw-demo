@@ -37,8 +37,10 @@ GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 GITLAB_TOKEN = os.getenv("GITLAB_TOKEN", "")
 AZURE_DEVOPS_TOKEN = os.getenv("AZURE_DEVOPS_TOKEN", "")
 AZURE_DEVOPS_ORG = os.getenv("AZURE_DEVOPS_ORG", "")
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gpt-oss:20b")
+AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "")
+AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY", "")
+AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-12-01-preview")
+AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
 
 # Initialize SSH key manager
 ssh_manager = SSHKeyManager(SSH_KEYS_DIR)
@@ -1393,8 +1395,10 @@ async def _process_file(file_path: Path, repo_root: Path) -> dict | None:
         response = await update_code_with_locators(
             content,
             file_name,
-            ollama_url=OLLAMA_URL,
-            ollama_model=OLLAMA_MODEL,
+            azure_endpoint=AZURE_OPENAI_ENDPOINT,
+            azure_api_key=AZURE_OPENAI_API_KEY,
+            azure_api_version=AZURE_OPENAI_API_VERSION,
+            azure_deployment=AZURE_OPENAI_DEPLOYMENT,
         )
         new_locators = extract_locators_from_code(response.code)
         return {

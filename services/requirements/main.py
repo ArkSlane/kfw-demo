@@ -88,6 +88,9 @@ def to_out(doc) -> RequirementOut:
         source=doc.get("source"),
         tags=doc.get("tags", []),
         release_id=doc.get("release_id"),
+        review_status=doc.get("review_status"),
+        reviewed_by=doc.get("reviewed_by"),
+        reviewed_at=doc.get("reviewed_at"),
         created_at=doc["created_at"],
         updated_at=doc["updated_at"],
     )
@@ -215,6 +218,7 @@ async def create_requirement(payload: RequirementCreate):
 )
 async def list_requirements(
     q: str | None = Query(None, description="Search text (searches in title and description)"),
+    review_status: str | None = Query(None, description="Filter by review_status (pending_review, approved, rejected)"),
     limit: int = Query(50, ge=1, le=200, description="Maximum number of results to return"),
     skip: int = Query(0, ge=0, description="Number of results to skip for pagination"),
 ):
@@ -231,7 +235,9 @@ async def list_requirements(
     db = get_db()
     filt = {}
     if q:
-        filt = {"$or": [{"title": {"$regex": q, "$options": "i"}}, {"description": {"$regex": q, "$options": "i"}}]}
+        filt["$or"] = [{"title": {"$regex": q, "$options": "i"}}, {"description": {"$regex": q, "$options": "i"}}]
+    if review_status:
+        filt["review_status"] = review_status
     cursor = db[COL].find(filt).sort("updated_at", -1).skip(skip).limit(limit)
     return [to_out(d) async for d in cursor]
 
@@ -365,3 +371,41 @@ async def delete_requirement(requirement_id: str):
     if res.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Requirement not found")
     return None
+
+
+@app.post(
+    "/requirements/{requirement_id}/approve",
+    response_model=RequirementOut,
+    tags=["requirements"],
+    summary="Approve Requirement",
+    description="Approve a pending requirement, moving it from AI suggestions to the main list.",
+)
+async def approve_requirement(requirement_id: str, reviewed_by: str = Query(..., description="Username of the reviewer")):
+    db = get_db()
+    result = await db[COL].find_one_and_update(
+        {"_id": oid(requirement_id)},
+        {"$set": {"review_status": "approved", "reviewed_by": reviewed_by, "reviewed_at": now(), "updated_at": now()}},
+        return_document=True,
+    )
+    if not result:
+        raise HTTPException(status_code=404, detail="Requirement not found")
+    return to_out(result)
+
+
+@app.post(
+    "/requirements/{requirement_id}/reject",
+    response_model=RequirementOut,
+    tags=["requirements"],
+    summary="Reject Requirement",
+    description="Reject a pending requirement.",
+)
+async def reject_requirement(requirement_id: str, reviewed_by: str = Query(..., description="Username of the reviewer")):
+    db = get_db()
+    result = await db[COL].find_one_and_update(
+        {"_id": oid(requirement_id)},
+        {"$set": {"review_status": "rejected", "reviewed_by": reviewed_by, "reviewed_at": now(), "updated_at": now()}},
+        return_document=True,
+    )
+    if not result:
+        raise HTTPException(status_code=404, detail="Requirement not found")
+    return to_out(result)

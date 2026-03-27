@@ -14,8 +14,9 @@ if str(REPO_ROOT) not in sys.path:
 
 
 # Set test environment variables
-os.environ["OLLAMA_URL"] = "http://test-ollama:11434"
-os.environ["OLLAMA_MODEL"] = "test-model"
+os.environ["AZURE_OPENAI_ENDPOINT"] = "https://test-azure.openai.azure.com"
+os.environ["AZURE_OPENAI_API_KEY"] = "test-key"
+os.environ["AZURE_OPENAI_DEPLOYMENT"] = "test-model"
 os.environ["REQUIREMENTS_SERVICE_URL"] = "http://test-requirements:8000"
 os.environ["TESTCASES_SERVICE_URL"] = "http://test-testcases:8000"
 os.environ["AUTOMATIONS_SERVICE_URL"] = "http://test-automations:8000"
@@ -30,7 +31,7 @@ os.environ["TEST_FILES_PATH"] = "tests/generated"
 def test_environment():
     """Provide test environment configuration."""
     return {
-        "ollama_url": os.getenv("OLLAMA_URL"),
+        "azure_endpoint": os.getenv("AZURE_OPENAI_ENDPOINT"),
         "git_service_url": os.getenv("GIT_SERVICE_URL"),
         "tests_repo_url": os.getenv("TESTS_REPO_URL"),
     }

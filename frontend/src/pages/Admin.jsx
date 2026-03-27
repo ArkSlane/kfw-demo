@@ -24,14 +24,13 @@ const viteEnv = /** @type {any} */ (import.meta).env;
 const DEFAULT_SERVICE_URLS = {
   requirements: viteEnv?.VITE_REQUIREMENTS_URL || "http://localhost:8001",
   testcases: viteEnv?.VITE_TESTCASES_URL || "http://localhost:8002",
-  generator: viteEnv?.VITE_GENERATOR_URL || "http://localhost:8003",
+  generator: viteEnv?.VITE_GENERATOR_URL || "http://localhost:8013",
   releases: viteEnv?.VITE_RELEASES_URL || "http://localhost:8004",
   executions: viteEnv?.VITE_EXECUTIONS_URL || "http://localhost:8005",
   automations: viteEnv?.VITE_AUTOMATIONS_URL || "http://localhost:8006",
   git: viteEnv?.VITE_GIT_URL || "http://localhost:8007",
   toabrkia: viteEnv?.VITE_TOABRKIA_URL || "http://localhost:8008",
   testcaseMigration: viteEnv?.VITE_TESTCASE_MIGRATION_URL || "http://localhost:8009",
-  ollama: viteEnv?.VITE_OLLAMA_URL || "http://localhost:11434",
 };
 
 const STORAGE_KEYS = {
@@ -163,6 +162,7 @@ export default function Admin() {
   const [kgNewPageDialogs, setKgNewPageDialogs] = useState("");
   const [kgNewButtonLabel, setKgNewButtonLabel] = useState("");
   const [kgNewAriaLabel, setKgNewAriaLabel] = useState("");
+  const [analyzingKG, setAnalyzingKG] = useState(false);
 
   // Demo settings
   const { demoBannerEnabled, setDemoBannerEnabled } = useDemoSettings();
@@ -257,6 +257,45 @@ export default function Admin() {
     } catch (e) {
       console.error("Failed to delete knowledge graph", e);
       toast.error("Failed to delete knowledge graph");
+    }
+  };
+
+  const analyzeKG = async () => {
+    if (!kgForm.app_name.trim() || !kgForm.base_url.trim()) {
+      toast.error("App name and Base URL are required for analysis");
+      return;
+    }
+    setAnalyzingKG(true);
+    try {
+      const result = await knowledgeGraphAPI.analyze({
+        app_name: kgForm.app_name,
+        framework: kgForm.framework,
+        base_url: kgForm.base_url,
+      });
+      // Merge analyzed results into the form
+      setKgForm((f) => ({
+        ...f,
+        selector_strategy: result.selector_strategy || f.selector_strategy,
+        nav_items: (result.nav_items || []).map((ni) => ({
+          label: ni.label || "",
+          route: ni.route || "",
+        })),
+        pages: (result.pages || []).map((p) => ({
+          route: p.route || "",
+          description: p.description || "",
+          key_buttons: p.key_buttons || [],
+          filters: p.filters || [],
+          dialogs: p.dialogs || [],
+        })),
+        common_button_labels: result.common_button_labels || f.common_button_labels,
+        aria_labels: result.aria_labels || f.aria_labels,
+      }));
+      toast.success(`Application analyzed! ${result.pages_crawled || 1} page(s) crawled. Review the extracted data below.`);
+    } catch (e) {
+      console.error("Failed to analyze application", e);
+      toast.error("Failed to analyze application. Make sure PinchTab is running and the URL is accessible.");
+    } finally {
+      setAnalyzingKG(false);
     }
   };
 
@@ -480,8 +519,6 @@ export default function Admin() {
         { key: "git", url: `${DEFAULT_SERVICE_URLS.git}/health` },
         { key: "toabrkia", url: `${DEFAULT_SERVICE_URLS.toabrkia}/health` },
         { key: "testcase-migration", url: `${DEFAULT_SERVICE_URLS.testcaseMigration}/health` },
-        // Ollama doesn't expose /health; use /api/tags.
-        { key: "ollama", url: `${DEFAULT_SERVICE_URLS.ollama}/api/tags` },
       ];
 
       const results = await Promise.all(
@@ -920,7 +957,7 @@ export default function Admin() {
             <div className="flex items-start justify-between gap-4">
               <div className="space-y-1">
                 <div className="text-sm font-medium text-slate-900">Service health</div>
-                <div className="text-xs text-slate-600">Checks /health for services and /api/tags for Ollama.</div>
+                <div className="text-xs text-slate-600">Checks /health for all services.</div>
               </div>
               <Button onClick={refreshHealth} disabled={loadingHealth}>
                 {loadingHealth ? "Refreshing..." : "Refresh"}
@@ -1256,6 +1293,32 @@ export default function Admin() {
                       Default knowledge graph
                     </label>
                   </div>
+                </div>
+
+                {/* AI Analyze Button */}
+                <div className="flex items-center gap-3 p-3 bg-gradient-to-r from-purple-50 to-blue-50 rounded-lg border border-purple-200">
+                  <div className="flex-1">
+                    <div className="text-sm font-medium text-purple-900">AI Application Analysis</div>
+                    <div className="text-xs text-purple-600">Use PinchTab to crawl the entire application — discovers navigation links and visits each page to extract buttons, filters, dialogs, and selectors.</div>
+                  </div>
+                  <Button
+                    size="sm"
+                    onClick={analyzeKG}
+                    disabled={analyzingKG || !kgForm.app_name.trim() || !kgForm.base_url.trim()}
+                    className="bg-purple-600 hover:bg-purple-700 gap-2"
+                  >
+                    {analyzingKG ? (
+                      <>
+                        <div className="animate-spin rounded-full h-3 w-3 border-2 border-white border-t-transparent" />
+                        Crawling App…
+                      </>
+                    ) : (
+                      <>
+                        <span className="text-sm">🔍</span>
+                        Analyze App
+                      </>
+                    )}
+                  </Button>
                 </div>
 
                 <div className="space-y-1">

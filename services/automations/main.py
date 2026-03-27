@@ -205,6 +205,7 @@ class AutomationCreate(BaseModel):
     video_path: Optional[str] = Field(None, max_length=500)
     last_actions: Optional[str] = Field(None, max_length=100000)
     metadata: dict = {}
+    review_status: Optional[str] = None
 
 class AutomationUpdate(BaseModel):
     title: Optional[str] = Field(None, max_length=500)
@@ -216,11 +217,16 @@ class AutomationUpdate(BaseModel):
     last_run_at: Optional[datetime] = None
     video_path: Optional[str] = Field(None, max_length=500)
     metadata: Optional[dict] = None
+    review_status: Optional[str] = None
+    reviewed_by: Optional[str] = None
+    reviewed_at: Optional[datetime] = None
 
 class AutomationOut(AutomationCreate):
     id: str
     last_run_result: Optional[str] = None
     last_run_at: Optional[datetime] = None
+    reviewed_by: Optional[str] = None
+    reviewed_at: Optional[datetime] = None
     created_at: datetime
     updated_at: datetime
 
@@ -247,6 +253,9 @@ def to_out(doc) -> AutomationOut:
         video_path=doc.get("video_path"),
         last_actions=doc.get("last_actions"),
         metadata=doc.get("metadata", {}),
+        review_status=doc.get("review_status"),
+        reviewed_by=doc.get("reviewed_by"),
+        reviewed_at=doc.get("reviewed_at"),
         created_at=doc["created_at"],
         updated_at=doc["updated_at"],
     )
@@ -288,6 +297,7 @@ async def list_automations(
     test_case_id: str | None = Query(None),
     status: str | None = Query(None),
     framework: str | None = Query(None),
+    review_status: str | None = Query(None, description="Filter by review_status (pending_review, approved, rejected)"),
     limit: int = Query(50, ge=1, le=200),
     skip: int = Query(0, ge=0),
 ):
@@ -299,6 +309,8 @@ async def list_automations(
         filt["status"] = status
     if framework:
         filt["framework"] = framework
+    if review_status:
+        filt["review_status"] = review_status
     cursor = db[COL].find(filt).sort("updated_at", -1).skip(skip).limit(limit)
     return [to_out(d) async for d in cursor]
 
@@ -363,6 +375,33 @@ async def delete_automation(automation_id: str):
     res = await db[COL].delete_one({"_id": oid(automation_id)})
     if res.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Automation not found")
+
+
+@app.post("/automations/{automation_id}/approve", response_model=AutomationOut, tags=["automations"], summary="Approve Automation")
+async def approve_automation(automation_id: str, reviewed_by: str = Query(..., description="Username of the reviewer")):
+    db = get_db()
+    result = await db[COL].find_one_and_update(
+        {"_id": oid(automation_id)},
+        {"$set": {"review_status": "approved", "reviewed_by": reviewed_by, "reviewed_at": now(), "updated_at": now()}},
+        return_document=True,
+    )
+    if not result:
+        raise HTTPException(status_code=404, detail="Automation not found")
+    return to_out(result)
+
+
+@app.post("/automations/{automation_id}/reject", response_model=AutomationOut, tags=["automations"], summary="Reject Automation")
+async def reject_automation(automation_id: str, reviewed_by: str = Query(..., description="Username of the reviewer")):
+    db = get_db()
+    result = await db[COL].find_one_and_update(
+        {"_id": oid(automation_id)},
+        {"$set": {"review_status": "rejected", "reviewed_by": reviewed_by, "reviewed_at": now(), "updated_at": now()}},
+        return_document=True,
+    )
+    if not result:
+        raise HTTPException(status_code=404, detail="Automation not found")
+    return to_out(result)
+
 
 @app.post("/automations/{automation_id}/execute")
 async def execute_automation(automation_id: str, request: Request):

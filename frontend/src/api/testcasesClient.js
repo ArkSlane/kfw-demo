@@ -6,10 +6,11 @@ const client = createApiClient(API_BASE_URL);
 
 export const testcasesAPI = {
   // List all testcases
-  list: async (q = null, limit = 50, skip = 0) => {
+  list: async (q = null, limit = 50, skip = 0, review_status = null) => {
     try {
       const params = { limit, skip };
       if (q) params.q = q;
+      if (review_status) params.review_status = review_status;
       const response = await client.get('/testcases', { params });
       return Array.isArray(response.data) ? response.data : response.data.data || [];
     } catch (error) {
@@ -66,5 +67,17 @@ export const testcasesAPI = {
     } catch (error) {
       return null;
     }
+  },
+
+  // Approve a pending testcase
+  approve: async (testcaseId, reviewedBy) => {
+    const response = await client.post(`/testcases/${testcaseId}/approve`, null, { params: { reviewed_by: reviewedBy } });
+    return response.data;
+  },
+
+  // Reject a pending testcase
+  reject: async (testcaseId, reviewedBy) => {
+    const response = await client.post(`/testcases/${testcaseId}/reject`, null, { params: { reviewed_by: reviewedBy } });
+    return response.data;
   },
 };

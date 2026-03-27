@@ -91,7 +91,12 @@ export default function AutomationDialog({ open, onOpenChange, automation, testC
   const handleSubmit = async (e) => {
     e.preventDefault();
 
-    onSubmit(formData);
+    const submitData = {
+      ...formData,
+      test_case_id: formData.test_case_id === '_none' ? '' : formData.test_case_id,
+      release_id: formData.release_id === '_none' ? '' : formData.release_id,
+    };
+    onSubmit(submitData);
   };
 
   return (
@@ -140,7 +145,7 @@ export default function AutomationDialog({ open, onOpenChange, automation, testC
                     <SelectValue placeholder="Select test case" />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value={null}>None</SelectItem>
+                    <SelectItem value="_none">None</SelectItem>
                     {testCases.map((tc) => (
                       <SelectItem key={tc.id} value={tc.id}>
                         {tc.title.length > 30 ? tc.title.substring(0, 30) + '...' : tc.title}
@@ -157,7 +162,7 @@ export default function AutomationDialog({ open, onOpenChange, automation, testC
                     <SelectValue placeholder="Select release" />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value={null}>None</SelectItem>
+                    <SelectItem value="_none">None</SelectItem>
                     {releases.map((rel) => (
                       <SelectItem key={rel.id} value={rel.id}>
                         {rel.name} {rel.version && `(v${rel.version})`}

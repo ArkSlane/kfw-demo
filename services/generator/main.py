@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Literal
 import re
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, ValidationError, ConfigDict, field_validator
@@ -14,7 +14,7 @@ from bson import ObjectId
 from shared.db import get_db, close_client
 from shared.models import GenerateRequest, GenerateResult, TestcaseOut
 from shared.errors import setup_all_error_handlers
-from shared.health import check_ollama, check_playwright_mcp, check_http_service, aggregate_health_status
+from shared.health import check_azure_llm, check_playwright_mcp, check_http_service, aggregate_health_status
 from shared.settings import CORS_ORIGINS, LOG_LEVEL, LOG_FORMAT_JSON, validate_settings
 from shared.logging_config import setup_logging, get_logger
 from shared.auth import setup_auth
@@ -30,19 +30,21 @@ from git_integration import push_test_to_git, trigger_test_execution
 
 logger = get_logger(__name__)
 
-# Ollama configuration
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434")
-# Default model aligned with docker-compose (keep in sync)
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gpt-oss:20b")
+# Azure AI Foundry configuration
+AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "")
+AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY", "")
+AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-12-01-preview")
+AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
+LLM_MODEL = AZURE_OPENAI_DEPLOYMENT
 # Deterministic model sampling params to reduce nondeterministic outputs
-OLLAMA_TEMPERATURE = float(os.getenv("OLLAMA_TEMPERATURE", "0"))
-OLLAMA_TOP_P = float(os.getenv("OLLAMA_TOP_P", "1"))
-OLLAMA_MAX_TOKENS = int(os.getenv("OLLAMA_MAX_TOKENS", "2048"))
+LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0"))
+LLM_TOP_P = float(os.getenv("LLM_TOP_P", "1"))
+LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "8192"))
 AUTOMATIONS_URL = os.getenv("AUTOMATIONS_SERVICE_URL", "http://automations:8000")
 PLAYWRIGHT_MCP_URL = os.getenv("PLAYWRIGHT_MCP_URL", "http://playwright-mcp-agent:3000")
-OLLAMA_MCP_AGENT_URL = os.getenv("OLLAMA_MCP_AGENT_URL", "http://ollama-mcp-agent:3000")
 RELEASES_URL = os.getenv("RELEASES_SERVICE_URL", "http://localhost:8004")
 ORCHESTRATOR_URL = os.getenv("ORCHESTRATOR_SERVICE_URL", "http://orchestrator:8000")
+PINCHTAB_URL = os.getenv("PINCHTAB_URL", "http://pinchtab:9867")
 
 # ---------------------------------------------------------------------------
 # App Knowledge Graph — static map of the frontend UI for LLM context
@@ -423,14 +425,14 @@ app = FastAPI(
     lifespan=lifespan,
     title="Testcase Generator Service",
     version="1.0.0",
-    description="""AI-powered test case and automation generation service using Ollama LLM.
+    description="""AI-powered test case and automation generation service using Azure OpenAI LLM.
     
     ## Features
     - Generate test cases from requirements using AI
     - Create automation scripts from test cases
     - Support for multiple generation modes (replace, append)
     - Customizable generation amount
-    - Integration with Ollama for LLM inference
+    - Integration with Azure OpenAI for LLM inference
     - Playwright script generation
     
     ## Use Cases
@@ -519,25 +521,33 @@ async def _execute_script_with_retries(client: httpx.AsyncClient, script: str, v
             raise last_exc
 
 
-async def _ollama_generate_request(client: httpx.AsyncClient, prompt: str, extra: dict | None = None, timeout: int = 90) -> dict:
-    """Helper that calls the Ollama generate endpoint with deterministic params from env.
+async def _azure_generate_request(client: httpx.AsyncClient, prompt: str, extra: dict | None = None, timeout: int = 90) -> dict:
+    """Helper that calls the Azure OpenAI chat completions endpoint.
 
-    Returns the parsed JSON body from Ollama or raises the underlying httpx exception.
+    Returns a dict with a 'response' key containing the generated text.
     """
+    messages = [{"role": "user", "content": prompt}]
     payload = {
-        "model": OLLAMA_MODEL,
-        "prompt": prompt,
-        "stream": False,
-        "temperature": float(OLLAMA_TEMPERATURE),
-        "top_p": float(OLLAMA_TOP_P),
-        "max_tokens": int(OLLAMA_MAX_TOKENS),
+        "messages": messages,
+        "model": AZURE_OPENAI_DEPLOYMENT,
+        "temperature": LLM_TEMPERATURE,
+        "top_p": LLM_TOP_P,
+        "max_tokens": LLM_MAX_TOKENS,
     }
     if extra:
         payload.update(extra)
 
-    resp = await client.post(f"{OLLAMA_URL}/api/generate", json=payload, timeout=timeout)
+    url = f"{AZURE_OPENAI_ENDPOINT.rstrip('/')}/openai/deployments/{AZURE_OPENAI_DEPLOYMENT}/chat/completions?api-version={AZURE_OPENAI_API_VERSION}"
+    resp = await client.post(
+        url,
+        json=payload,
+        headers={"api-key": AZURE_OPENAI_API_KEY, "Content-Type": "application/json"},
+        timeout=timeout,
+    )
     resp.raise_for_status()
-    return resp.json()
+    data = resp.json()
+    text = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+    return {"response": text}
 
 
 def _dynamic_max_retries(exec_error: str | None) -> int:
@@ -602,7 +612,7 @@ async def _report_outcome_to_orchestrator(
             json={
                 "test_case_id": test_case_id,
                 "requirement_id": requirement_id,
-                "model": OLLAMA_MODEL,
+                "model": LLM_MODEL,
                 "generation_mode": generation_mode,
                 "first_try_success": first_try_success,
                 "repair_attempts": repair_attempts,
@@ -698,7 +708,7 @@ async def _repair_and_rerun(
         )
 
         try:
-            data = await _ollama_generate_request(client, prompt, timeout=120)
+            data = await _azure_generate_request(client, prompt, timeout=120)
             text = (data.get("response") or data.get("output") or "").strip()
             text = _strip_markdown_code_fences(text)
             candidate = _unwrap_playwright_script_to_page_only(text)
@@ -790,7 +800,7 @@ async def _get_page_snapshot(client: httpx.AsyncClient) -> str | None:
 
     Uses a lightweight script that returns the page title + URL + visible text
     via the `/execute` endpoint — much faster than spinning up the full agentic
-    ollama-mcp-agent /run loop.  Returns the snapshot text or *None* on failure.
+    Azure OpenAI-mcp-agent /run loop.  Returns the snapshot text or *None* on failure.
     """
     # Fast path: run a small script that harvests key selectors from the live page.
     # This avoids the 15-30s agentic loop from before.
@@ -958,6 +968,235 @@ async def delete_knowledge_graph(kg_id: str):
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Knowledge graph not found")
     return {"deleted": True}
+
+
+class KGAnalyzeRequest(BaseModel):
+    app_name: str
+    framework: str = ""
+    base_url: str
+
+
+async def _pinchtab_snapshot_page(client: httpx.AsyncClient, instance_id: str, url: str) -> dict:
+    """Navigate to a URL in a new PinchTab tab, snapshot interactive elements and text, then close.
+
+    Returns ``{"url": ..., "snapshot": ..., "text": ...}`` or an error entry.
+    """
+    try:
+        tab_resp = await client.post(
+            f"{PINCHTAB_URL}/instances/{instance_id}/tabs/open",
+            json={"url": url},
+            timeout=30,
+        )
+        tab_resp.raise_for_status()
+        tab_id = tab_resp.json().get("tabId")
+
+        # Let the page render (SPAs need a moment)
+        await asyncio.sleep(3)
+
+        snap_resp = await client.get(
+            f"{PINCHTAB_URL}/tabs/{tab_id}/snapshot",
+            params={"filter": "interactive", "format": "compact"},
+            timeout=30,
+        )
+        snap_resp.raise_for_status()
+        snapshot = snap_resp.text
+
+        text_resp = await client.get(
+            f"{PINCHTAB_URL}/tabs/{tab_id}/text",
+            timeout=15,
+        )
+        page_text = text_resp.text if text_resp.status_code == 200 else ""
+
+        # Close the tab to free memory
+        try:
+            await client.delete(f"{PINCHTAB_URL}/tabs/{tab_id}", timeout=5)
+        except Exception:
+            pass
+
+        return {"url": url, "snapshot": snapshot, "text": page_text}
+    except Exception as e:
+        logger.warning(f"PinchTab snapshot failed for {url}: {e}")
+        return {"url": url, "snapshot": "", "text": "", "error": str(e)}
+
+
+@app.post("/knowledge-graphs/analyze", tags=["knowledge-graph"])
+async def analyze_page_for_knowledge_graph(body: KGAnalyzeRequest):
+    """Use PinchTab to crawl ALL pages of an application and LLM to extract a knowledge graph.
+
+    Flow:
+    1. Navigate to base_url and snapshot the landing page
+    2. Ask LLM to extract internal navigation links from the snapshot
+    3. Visit each discovered link and snapshot it
+    4. Send ALL page snapshots to LLM for final structured extraction
+    """
+    base = body.base_url.rstrip("/")
+
+    async with httpx.AsyncClient() as client:
+        # ── 1. Launch a headless PinchTab instance ──────────────────────
+        try:
+            launch_resp = await client.post(
+                f"{PINCHTAB_URL}/instances/launch",
+                json={"name": f"kg-analyze-{int(datetime.now(timezone.utc).timestamp())}", "mode": "headless"},
+                timeout=30,
+            )
+            launch_resp.raise_for_status()
+            instance_id = launch_resp.json().get("id")
+        except Exception as e:
+            logger.error(f"PinchTab launch failed: {e}")
+            raise HTTPException(status_code=502, detail=f"Failed to connect to PinchTab: {e}")
+
+        try:
+            # ── 2. Snapshot the landing page ────────────────────────────
+            landing = await _pinchtab_snapshot_page(client, instance_id, base)
+
+            # ── 3. Ask LLM to extract internal links from landing page ─
+            link_prompt = f"""From this web page snapshot, extract ALL internal navigation links (sidebar, header, menus).
+
+Base URL: {base}
+
+--- SNAPSHOT ---
+{landing['snapshot'][:6000]}
+
+--- PAGE TEXT ---
+{landing['text'][:3000]}
+---
+
+Return ONLY a JSON array of absolute URLs. Include the base URL itself.
+No markdown fences, no explanation, just a JSON array of strings.
+Only include URLs that belong to the same application (same origin or relative paths).
+Convert relative paths to absolute URLs using the base URL.
+Example: ["{base}", "{base}/page1", "{base}/page2"]"""
+
+            try:
+                link_result = await _azure_generate_request(client, link_prompt, timeout=60)
+                raw_links = link_result.get("response", "").strip()
+                # Strip markdown fences
+                if raw_links.startswith("```"):
+                    raw_links = raw_links.split("\n", 1)[-1]
+                if raw_links.endswith("```"):
+                    raw_links = raw_links.rsplit("```", 1)[0]
+                discovered_urls = json.loads(raw_links.strip())
+                if not isinstance(discovered_urls, list):
+                    discovered_urls = [base]
+            except Exception:
+                logger.warning("Failed to extract links from LLM, falling back to base URL only")
+                discovered_urls = [base]
+
+            # Deduplicate, normalise, and cap at 20 pages to avoid runaway crawls
+            seen = set()
+            unique_urls = []
+            for u in discovered_urls:
+                # Resolve relative URLs
+                resolved = urljoin(base + "/", u)
+                normalised = resolved.rstrip("/")
+                if normalised not in seen:
+                    seen.add(normalised)
+                    unique_urls.append(resolved)
+            unique_urls = unique_urls[:20]
+
+            logger.info(f"KG analysis: discovered {len(unique_urls)} pages to crawl")
+
+            # ── 4. Snapshot every discovered page ──────────────────────
+            all_snapshots = []
+            for page_url in unique_urls:
+                # Re-use landing snapshot if it matches
+                if page_url.rstrip("/") == base:
+                    all_snapshots.append(landing)
+                else:
+                    snap = await _pinchtab_snapshot_page(client, instance_id, page_url)
+                    all_snapshots.append(snap)
+
+        finally:
+            # ── 5. Clean up PinchTab instance ──────────────────────────
+            try:
+                await client.delete(f"{PINCHTAB_URL}/instances/{instance_id}", timeout=10)
+            except Exception:
+                pass
+
+        # ── 6. Build a combined context from all page snapshots ────────
+        pages_context = ""
+        for i, snap in enumerate(all_snapshots):
+            if snap.get("error") and not snap["snapshot"]:
+                continue
+            pages_context += f"\n\n===== PAGE {i+1}: {snap['url']} =====\n"
+            pages_context += f"--- Interactive Elements ---\n{snap['snapshot'][:3000]}\n"
+            pages_context += f"--- Page Text ---\n{snap['text'][:1500]}\n"
+
+        # ── 7. Send ALL snapshots to Azure OpenAI for structured extraction ──
+        analysis_prompt = f"""Analyze these web page snapshots from a multi-page application and extract a comprehensive knowledge graph for test automation.
+
+App Name: {body.app_name}
+Framework: {body.framework}
+Base URL: {body.base_url}
+Total pages crawled: {len(all_snapshots)}
+
+{pages_context[:25000]}
+
+---
+
+Extract the following as JSON (no markdown fences, just raw JSON):
+{{
+  "selector_strategy": "<describe the best selector strategy based on the elements you see across all pages>",
+  "nav_items": [
+    {{"label": "<visible text>", "route": "<href or route path>"}}
+  ],
+  "pages": [
+    {{
+      "route": "<page route>",
+      "description": "<what this page does based on its content>",
+      "key_buttons": ["<button labels found on this page>"],
+      "filters": ["<filter/select elements found on this page>"],
+      "dialogs": ["<any dialog titles or triggers on this page>"]
+    }}
+  ],
+  "common_button_labels": ["<button texts that appear across multiple pages>"],
+  "aria_labels": ["<any aria-label values found across all pages>"]
+}}
+
+Rules:
+- Create one entry in pages for EACH page that was crawled
+- For nav_items, extract the main sidebar/header navigation links
+- For each page, list the interactive elements specific to that page
+- common_button_labels should include buttons seen on multiple pages (Save, Cancel, Delete, etc.)
+- Include all unique aria-label values found
+- Return ONLY valid JSON, no explanations"""
+
+        try:
+            llm_result = await _azure_generate_request(client, analysis_prompt, timeout=180)
+            raw_response = llm_result.get("response", "")
+
+            cleaned = raw_response.strip()
+            if cleaned.startswith("```"):
+                cleaned = cleaned.split("\n", 1)[-1]
+            if cleaned.endswith("```"):
+                cleaned = cleaned.rsplit("```", 1)[0]
+            cleaned = cleaned.strip()
+
+            parsed = json.loads(cleaned)
+            return {
+                "app_name": body.app_name,
+                "framework": body.framework,
+                "base_url": body.base_url,
+                "pages_crawled": len(all_snapshots),
+                **parsed,
+            }
+        except json.JSONDecodeError:
+            logger.warning(f"LLM returned non-JSON for KG analysis: {raw_response[:500]}")
+            return {
+                "app_name": body.app_name,
+                "framework": body.framework,
+                "base_url": body.base_url,
+                "pages_crawled": len(all_snapshots),
+                "raw_analysis": raw_response,
+                "selector_strategy": "",
+                "nav_items": [],
+                "pages": [],
+                "common_button_labels": [],
+                "aria_labels": [],
+            }
+        except Exception as e:
+            logger.error(f"Azure OpenAI analysis failed: {e}")
+            raise HTTPException(status_code=502, detail=f"LLM analysis failed: {e}")
 
 
 async def _load_knowledge_graph_for_app(app_name: str | None = None) -> dict | None:
@@ -1204,7 +1443,7 @@ def _rewrite_goto_lines(code: str) -> str:
 
 
 def build_script_from_agent_transcript(transcript) -> str:
-    """Extract runnable Playwright code from the Ollama-MCP agent transcript."""
+    """Extract runnable Playwright code from the Azure OpenAI-MCP agent transcript."""
     if not transcript or not isinstance(transcript, list):
         return "// No actions captured"
 
@@ -1617,7 +1856,7 @@ def _fallback_structured_testcase(requirement_title: str, requirement_desc: str 
     return StructuredTestcase(title=title, description=description, priority="medium", steps=steps)
 
 
-async def generate_structured_testcase_with_ollama(
+async def generate_structured_testcase_with_llm(
     client: httpx.AsyncClient,
     requirement_title: str,
     requirement_desc: str | None,
@@ -1648,7 +1887,7 @@ async def generate_structured_testcase_with_ollama(
             )
 
         try:
-            data = await _ollama_generate_request(client, prompt, timeout=90)
+            data = await _azure_generate_request(client, prompt, timeout=90)
             text = (data.get("response") or data.get("output") or "").strip()
             text = _strip_markdown_code_fences(text)
             json_text = _extract_first_json_object(text) or text
@@ -1726,7 +1965,7 @@ def _fallback_test_suite(requirement_title: str, requirement_desc: str | None) -
     return pos, neg
 
 
-async def generate_test_suite_with_ollama(
+async def generate_test_suite_with_llm(
     client: httpx.AsyncClient,
     requirement_title: str,
     requirement_desc: str | None,
@@ -1761,7 +2000,7 @@ async def generate_test_suite_with_ollama(
             )
 
         try:
-            data = await _ollama_generate_request(client, prompt, timeout=120)
+            data = await _azure_generate_request(client, prompt, timeout=120)
             text = (data.get("response") or data.get("output") or "").strip()
             text = _strip_markdown_code_fences(text)
             json_text = _extract_first_json_object(text) or text
@@ -1784,8 +2023,8 @@ async def generate_test_suite_with_ollama(
                 {
                     "positive_tests": positive_tests,
                     "negative_tests": negative_tests,
-                    "generator": "ollama",
-                    "model": OLLAMA_MODEL,
+                    "generator": "azure-openai",
+                    "model": LLM_MODEL,
                     "attempts": attempt,
                 }
             )
@@ -1809,7 +2048,7 @@ async def generate_test_suite_with_ollama(
     return None, 3, last_error
 
 
-async def generate_with_ollama(client: httpx.AsyncClient, requirement_title: str, requirement_desc: str | None, idx: int) -> str | None:
+async def generate_with_llm(client: httpx.AsyncClient, requirement_title: str, requirement_desc: str | None, idx: int) -> str | None:
     prompt = (
         "You are a QA engineer. Generate a concise Gherkin scenario for this requirement. "
         "Include Given/When/Then steps only."
@@ -1817,14 +2056,14 @@ async def generate_with_ollama(client: httpx.AsyncClient, requirement_title: str
         f"Scenario index: {idx}\n"
     )
     try:
-        data = await _ollama_generate_request(client, prompt, timeout=60)
+        data = await _azure_generate_request(client, prompt, timeout=60)
         text = (data.get("response") or data.get("output") or "").strip()
         return text or None
     except Exception:
         return None
 
 
-async def generate_automation_with_ollama(client: httpx.AsyncClient, test_case_title: str, description: str, preconditions: str, steps: list) -> str | None:
+async def generate_automation_with_llm(client: httpx.AsyncClient, test_case_title: str, description: str, preconditions: str, steps: list) -> str | None:
     steps_text = "\n".join([f"{i + 1}. Action: {s.action}\n   Expected: {s.expected_result or 'N/A'}" for i, s in enumerate(steps)]) if steps else "No steps defined"
     prompt = (
         "You are an automation engineer. Generate a complete Playwright script for this test case.\n"
@@ -1845,7 +2084,7 @@ async def generate_automation_with_ollama(client: httpx.AsyncClient, test_case_t
         "if (title !== 'Expected Title') throw new Error('Title mismatch');\n"
     )
     try:
-        data = await _ollama_generate_request(client, prompt, timeout=120)
+        data = await _azure_generate_request(client, prompt, timeout=120)
         text = (data.get("response") or data.get("output") or "").strip()
 
         # Remove markdown code blocks if present
@@ -2040,7 +2279,7 @@ async def _generate_playwright_script_single_call(
     prompt += "Generate the COMPLETE script now."
 
     try:
-        data = await _ollama_generate_request(client, prompt, timeout=120)
+        data = await _azure_generate_request(client, prompt, timeout=120)
         text = (data.get("response") or data.get("output") or "").strip()
         text = _strip_markdown_code_fences(text)
         if not text or len(text) < 20:
@@ -2059,7 +2298,7 @@ async def _generate_playwright_script_single_call(
         return None
 
 
-async def generate_playwright_script_step_by_step_with_ollama(
+async def generate_playwright_script_step_by_step_with_llm(
     client: httpx.AsyncClient,
     test_case_title: str,
     description: str,
@@ -2180,7 +2419,7 @@ async def generate_playwright_script_step_by_step_with_ollama(
         )
 
         try:
-            data = await _ollama_generate_request(client, prompt, timeout=120)
+            data = await _azure_generate_request(client, prompt, timeout=120)
             text = (data.get("response") or data.get("output") or "").strip()
             text = _strip_markdown_code_fences(text)
             if not text:
@@ -2212,7 +2451,7 @@ async def generate_playwright_script_step_by_step_with_ollama(
 async def health():
     # Check dependencies
     dependencies = {
-        "ollama": await check_ollama(OLLAMA_URL),
+        "azure-openai": await check_azure_llm(AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY),
         "playwright_mcp": await check_playwright_mcp(PLAYWRIGHT_MCP_URL),
         "requirements_service": await check_http_service("Requirements", REQ_URL),
         "testcases_service": await check_http_service("Testcases", TC_URL)
@@ -2248,7 +2487,7 @@ async def generate(payload: GenerateRequest, request: Request):
 
         # 3) generate & store
         for i in range(1, payload.amount + 1):
-            generated_gherkin = await generate_with_ollama(client, req["title"], req.get("description"), i)
+            generated_gherkin = await generate_with_llm(client, req["title"], req.get("description"), i)
             tc_payload = {
                 "requirement_id": payload.requirement_id,
                 "title": f"{req['title']} (auto #{i})",
@@ -2256,9 +2495,9 @@ async def generate(payload: GenerateRequest, request: Request):
                 "status": "draft",
                 "version": 1,
                 "metadata": {
-                    "generator": "ollama" if generated_gherkin else "stub-v1",
+                    "generator": "azure-openai" if generated_gherkin else "stub-v1",
                     "generated_at": now_iso(),
-                    "model": OLLAMA_MODEL,
+                    "model": LLM_MODEL,
                 },
             }
             created = await client.post(f"{TC_URL}/testcases", json=tc_payload)
@@ -2281,7 +2520,7 @@ async def generate_structured_testcase(payload: GenerateStructuredRequest, reque
         r.raise_for_status()
         req = r.json()
 
-        tc, attempts, last_error = await generate_structured_testcase_with_ollama(
+        tc, attempts, last_error = await generate_structured_testcase_with_llm(
             client,
             requirement_title=req.get("title") or "Requirement",
             requirement_desc=req.get("description"),
@@ -2292,8 +2531,8 @@ async def generate_structured_testcase(payload: GenerateStructuredRequest, reque
 
         return {
             "testcase": tc,
-            "generator": "ollama",
-            "model": OLLAMA_MODEL,
+            "generator": "azure-openai",
+            "model": LLM_MODEL,
             "attempts": attempts,
         }
 
@@ -2311,7 +2550,7 @@ async def generate_test_suite(payload: GenerateTestSuiteRequest, request: Reques
         r.raise_for_status()
         req = r.json()
 
-        suite, attempts, last_error = await generate_test_suite_with_ollama(
+        suite, attempts, last_error = await generate_test_suite_with_llm(
             client,
             requirement_title=req.get("title") or "Requirement",
             requirement_desc=req.get("description"),
@@ -2352,7 +2591,7 @@ async def generate_automation_from_execution(payload: ExecutionGenerateRequest, 
         # Load knowledge graph from DB (falls back to hardcoded default)
         kg = await _load_knowledge_graph_for_app()
 
-        script_outline, generation_log = await generate_playwright_script_step_by_step_with_ollama(
+        script_outline, generation_log = await generate_playwright_script_step_by_step_with_llm(
             client,
             test_case_title=title,
             description=description,
@@ -2426,7 +2665,7 @@ async def generate_automation_from_execution(payload: ExecutionGenerateRequest, 
             notes_with_code = f"{generation_note}\n\nCode:\n{script_outline}" if script_outline else generation_note
             generation_metadata = {
                 "generated_at": now_iso(),
-                "model": OLLAMA_MODEL,
+                "model": LLM_MODEL,
                 "preconditions": preconditions,
                 "video_filename": video_filename,
                 "generation_mode": "step_by_step",
@@ -2443,7 +2682,7 @@ async def generate_automation_from_execution(payload: ExecutionGenerateRequest, 
             )
             generation_metadata = {
                 "generated_at": now_iso(),
-                "model": OLLAMA_MODEL,
+                "model": LLM_MODEL,
                 "preconditions": preconditions,
                 "video_filename": video_filename,
                 "generation_mode": "fallback",
@@ -2525,7 +2764,7 @@ async def generate_automation_draft_from_execution(payload: ExecutionGenerateReq
         # Load knowledge graph from DB (falls back to hardcoded default)
         kg = await _load_knowledge_graph_for_app()
 
-        script_outline, generation_log = await generate_playwright_script_step_by_step_with_ollama(
+        script_outline, generation_log = await generate_playwright_script_step_by_step_with_llm(
             client,
             test_case_title=title,
             description=description,
@@ -2598,7 +2837,7 @@ async def generate_automation_draft_from_execution(payload: ExecutionGenerateReq
         notes = f"Generated step-by-step via LLM and executed on {now_iso()}."
         generation_metadata = {
             "generated_at": now_iso(),
-            "model": OLLAMA_MODEL,
+            "model": LLM_MODEL,
             "preconditions": preconditions,
             "video_filename": video_filename,
             "generation_mode": exec_mode,
@@ -2683,7 +2922,7 @@ async def automation_chat(payload: AutomationChatRequest, request: Request):
         last_text: str | None = None
         for _attempt in range(1, 4):
             try:
-                data = await _ollama_generate_request(
+                data = await _azure_generate_request(
                     client,
                     prompt if not last_error else (prompt + f"\nFix your JSON. Error: {last_error}"),
                 )
@@ -2773,7 +3012,7 @@ async def execute_script(payload: dict):
 async def generate_automation(payload: AutomationGenerateRequest):
     """Generate automation script outline and framework recommendation from test case details."""
     async with httpx.AsyncClient(timeout=20) as client:
-        automation_script = await generate_automation_with_ollama(
+        automation_script = await generate_automation_with_llm(
             client,
             payload.title,
             payload.description or "",
@@ -2830,10 +3069,10 @@ async def generate_automation(payload: AutomationGenerateRequest):
                     "framework": framework,
                     "script": automation_script,
                     "status": "not_started",
-                    "notes": f"Generated by {OLLAMA_MODEL} on {now_iso()}",
+                    "notes": f"Generated by {LLM_MODEL} on {now_iso()}",
                     "metadata": {
                         "generated_at": now_iso(),
-                        "model": OLLAMA_MODEL,
+                        "model": LLM_MODEL,
                         "preconditions": payload.preconditions,
                     }
                 }
@@ -2846,7 +3085,7 @@ async def generate_automation(payload: AutomationGenerateRequest):
             title=payload.title,
             framework=framework,
             script_outline=automation_script,
-            notes=f"Generated by {OLLAMA_MODEL} on {now_iso()}"
+            notes=f"Generated by {LLM_MODEL} on {now_iso()}"
         )
 
 
@@ -2930,7 +3169,7 @@ async def push_test_to_git_endpoint(payload: GitPushRequest, request: Request):
                         ))
 
             # Generate script content locally (do not call our own HTTP route with a relative URL)
-            script_content = await generate_automation_with_ollama(
+            script_content = await generate_automation_with_llm(
                 client,
                 test_title,
                 description,
@@ -2950,10 +3189,10 @@ async def push_test_to_git_endpoint(payload: GitPushRequest, request: Request):
                     "framework": "playwright",
                     "script": script_content,
                     "status": "not_started",
-                    "notes": f"Generated by {OLLAMA_MODEL} on {now_iso()}",
+                    "notes": f"Generated by {LLM_MODEL} on {now_iso()}",
                     "metadata": {
                         "generated_at": now_iso(),
-                        "model": OLLAMA_MODEL,
+                        "model": LLM_MODEL,
                         "preconditions": preconditions,
                     },
                 },
@@ -3008,6 +3247,6 @@ async def push_test_to_git_endpoint(payload: GitPushRequest, request: Request):
             title=payload.title,
             framework=framework,
             script_outline=automation_script,
-            notes=f"Generated by {OLLAMA_MODEL} on {now_iso()}"
+            notes=f"Generated by {LLM_MODEL} on {now_iso()}"
         )
 

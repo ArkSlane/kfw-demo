@@ -19,7 +19,7 @@ import {
 import DemoOverlay from "@/components/DemoOverlay";
 import { useAuth } from "@/lib/AuthContext";
 
-const navigationItems = [
+const fachbereichItems = [
   {
     title: "Test Plan",
     url: createPageUrl("TestPlan"),
@@ -51,24 +51,27 @@ const navigationItems = [
     icon: ClipboardCheck,
   },
   {
-    title: "Testcase Migration",
-    url: createPageUrl("testcase-migration"),
-    icon: ClipboardCheck,
+    title: "Executions",
+    url: createPageUrl("Executions"),
+    icon: PlayCircle,
   },
+];
+
+const technicalItems = [
   {
     title: "Automations",
     url: createPageUrl("Automations"),
     icon: Bot,
   },
   {
-    title: "Executions",
-    url: createPageUrl("Executions"),
-    icon: PlayCircle,
-  },
-  {
     title: "Locators",
     url: createPageUrl("Locators"),
     icon: Crosshair,
+  },
+  {
+    title: "Testcase Migration",
+    url: createPageUrl("testcase-migration"),
+    icon: ClipboardCheck,
   },
   {
     title: "Extract Requirements",
@@ -115,11 +118,36 @@ export default function Layout({ children }) {
           <SidebarContent className="p-3">
             <SidebarGroup>
               <SidebarGroupLabel className="text-xs font-semibold text-slate-500 uppercase tracking-wider px-3 py-2">
-                Navigation
+                Fachbereich
               </SidebarGroupLabel>
               <SidebarGroupContent>
                 <SidebarMenu>
-                  {navigationItems.map((item) => (
+                  {fachbereichItems.map((item) => (
+                    <SidebarMenuItem key={item.title}>
+                      <SidebarMenuButton 
+                        asChild 
+                        className={`hover:bg-blue-50 hover:text-blue-700 transition-all duration-200 rounded-lg mb-1 ${
+                          location.pathname === item.url ? 'bg-blue-50 text-blue-700 font-medium' : ''
+                        }`}
+                      >
+                        <Link to={item.url} className="flex items-center gap-3 px-3 py-2.5">
+                          <item.icon className="w-5 h-5" />
+                          <span>{item.title}</span>
+                        </Link>
+                      </SidebarMenuButton>
+                    </SidebarMenuItem>
+                  ))}
+                </SidebarMenu>
+              </SidebarGroupContent>
+            </SidebarGroup>
+
+            <SidebarGroup>
+              <SidebarGroupLabel className="text-xs font-semibold text-slate-500 uppercase tracking-wider px-3 py-2">
+                Technisch
+              </SidebarGroupLabel>
+              <SidebarGroupContent>
+                <SidebarMenu>
+                  {technicalItems.map((item) => (
                     <SidebarMenuItem key={item.title}>
                       <SidebarMenuButton 
                         asChild 

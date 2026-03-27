@@ -2,7 +2,7 @@ import { createApiClient } from './httpClient';
 
 // jsconfig.json enables checkJs; cast import.meta to any for Vite env access.
 const viteEnv = /** @type {any} */ (import.meta).env;
-const GENERATOR_URL = viteEnv?.VITE_GENERATOR_URL || 'http://localhost:8003';
+const GENERATOR_URL = viteEnv?.VITE_GENERATOR_URL || 'http://localhost:8013';
 
 const client = createApiClient(GENERATOR_URL);
 

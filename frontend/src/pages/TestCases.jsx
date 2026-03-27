@@ -7,11 +7,12 @@ import { executionsAPI } from "@/api/executionsClient";
 import generatorAPI from "@/api/generatorClient";
 import automationsAPI from "@/api/automationsClient";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { useAuth } from "@/lib/AuthContext";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Plus, ClipboardCheck, CheckCircle2, XCircle, AlertCircle, Sparkles, Filter, Bot, User, Calendar, Clock, Trash2, Play, Hash } from "lucide-react";
-import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import TestCaseDialog from "../components/testcases/TestCaseDialog";
 import ManualExecutionDialog from "../components/testcases/ManualExecutionDialog";
@@ -51,7 +52,9 @@ export default function TestCases() {
   const [sendingAutomationChat, setSendingAutomationChat] = useState(false);
   const [savingAutomation, setSavingAutomation] = useState(false);
   const [isExecutingAutomation, setIsExecutingAutomation] = useState(false);
+  const [pageTab, setPageTab] = useState("current");
   const queryClient = useQueryClient();
+  const { user } = useAuth();
 
   const transformTestCaseFromBackend = (tc) => {
     // Transform backend format back to frontend format
@@ -71,6 +74,15 @@ export default function TestCases() {
     queryKey: ['testCases'],
     queryFn: async () => {
       const data = await testcasesAPI.list();
+      return Array.isArray(data) ? data.map(transformTestCaseFromBackend) : [];
+    },
+    initialData: [],
+  });
+
+  const { data: pendingTestCases, isLoading: isPendingLoading } = useQuery({
+    queryKey: ['testCases', 'pending_review'],
+    queryFn: async () => {
+      const data = await testcasesAPI.list(null, 50, 0, 'pending_review');
       return Array.isArray(data) ? data.map(transformTestCaseFromBackend) : [];
     },
     initialData: [],
@@ -145,6 +157,22 @@ export default function TestCases() {
     onError: (error) => {
       toast.error('Failed to delete test case');
       console.error(error);
+    },
+  });
+
+  const approveTestCaseMutation = useMutation({
+    mutationFn: (id) => testcasesAPI.approve(id, user?.username || 'unknown'),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['testCases'] });
+      toast.success('Test case approved!');
+    },
+  });
+
+  const rejectTestCaseMutation = useMutation({
+    mutationFn: (id) => testcasesAPI.reject(id, user?.username || 'unknown'),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['testCases'] });
+      toast.success('Test case rejected');
     },
   });
 
@@ -384,6 +412,7 @@ export default function TestCases() {
         last_actions: automationDraft.actions_taken || null,
         metadata: automationDraft.metadata || {},
         video_path: automationDraft.video_path || null,
+        review_status: 'pending_review',
       };
 
       const saved = await automationsAPI.create(automationPayload);
@@ -535,6 +564,19 @@ export default function TestCases() {
         </Button>
       </div>
 
+      <Tabs value={pageTab} onValueChange={setPageTab}>
+        <TabsList className="bg-slate-100 mb-4">
+          <TabsTrigger value="current">
+            <ClipboardCheck className="w-4 h-4 mr-2" />
+            Test Cases
+          </TabsTrigger>
+          <TabsTrigger value="ai-suggestions">
+            <Sparkles className="w-4 h-4 mr-2" />
+            AI Suggestions
+          </TabsTrigger>
+        </TabsList>
+
+      <TabsContent value="current">
       <Card className="border-none shadow-md">
         <CardHeader className="border-b border-slate-100">
           <div className="flex items-center justify-between flex-wrap gap-4">
@@ -838,6 +880,88 @@ export default function TestCases() {
           )}
         </CardContent>
       </Card>
+      </TabsContent>
+
+      <TabsContent value="ai-suggestions">
+      <Card className="border-none shadow-md">
+        <CardHeader className="border-b border-slate-100">
+          <div className="flex items-center justify-between flex-wrap gap-4">
+            <CardTitle className="text-lg font-semibold">AI-Suggested Test Cases</CardTitle>
+            <Badge variant="outline" className="gap-1 text-purple-600 border-purple-300 bg-purple-50">
+              <Sparkles className="w-3 h-3" />
+              {pendingTestCases.length} Pending
+            </Badge>
+          </div>
+        </CardHeader>
+        <CardContent className="p-6">
+          {isPendingLoading ? (
+            <div className="text-center py-12 text-slate-500">Loading...</div>
+          ) : pendingTestCases.length === 0 ? (
+            <div className="text-center py-12">
+              <Sparkles className="w-16 h-16 mx-auto mb-4 text-purple-200" />
+              <p className="text-slate-500 mb-2">No AI suggestions yet</p>
+              <p className="text-sm text-slate-400">AI-generated test case suggestions will appear here for review and approval.</p>
+            </div>
+          ) : (
+            <div className="grid gap-4">
+              {pendingTestCases.map((tc) => {
+                const linkedReq = requirements.find(r => r.id === tc.requirement_id);
+                return (
+                  <Card key={tc.id} className="border border-purple-200 bg-purple-50/30">
+                    <CardContent className="p-6">
+                      <div className="flex items-start justify-between mb-3">
+                        <div className="flex-1">
+                          <div className="flex items-center gap-2 mb-2">
+                            <Sparkles className="w-4 h-4 text-purple-500" />
+                            <h3 className="text-lg font-semibold text-slate-900">{tc.title}</h3>
+                          </div>
+                          <p className="text-slate-600 text-sm line-clamp-3">{tc.description || tc.gherkin}</p>
+                        </div>
+                        <div className="ml-4 flex items-center gap-2">
+                          <Button
+                            size="sm"
+                            className="gap-1 bg-green-600 hover:bg-green-700"
+                            onClick={() => approveTestCaseMutation.mutate(tc.id)}
+                            disabled={approveTestCaseMutation.isPending}
+                          >
+                            <CheckCircle2 className="w-3 h-3" />
+                            Approve
+                          </Button>
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            className="gap-1 text-red-600 border-red-300 hover:bg-red-50"
+                            onClick={() => rejectTestCaseMutation.mutate(tc.id)}
+                            disabled={rejectTestCaseMutation.isPending}
+                          >
+                            <XCircle className="w-3 h-3" />
+                            Reject
+                          </Button>
+                        </div>
+                      </div>
+                      <div className="flex flex-wrap gap-2">
+                        {linkedReq && (
+                          <Badge variant="outline" className="text-slate-600 border-slate-300">
+                            Req: {linkedReq.title}
+                          </Badge>
+                        )}
+                        <Badge variant="outline" className={priorityColors[tc.priority] || 'bg-slate-50 text-slate-600 border-slate-300'}>
+                          {tc.priority}
+                        </Badge>
+                        <Badge variant="outline" className="text-slate-600 border-slate-300">
+                          {tc.status}
+                        </Badge>
+                      </div>
+                    </CardContent>
+                  </Card>
+                );
+              })}
+            </div>
+          )}
+        </CardContent>
+      </Card>
+      </TabsContent>
+      </Tabs>
 
       <TestCaseDialog
         open={dialogOpen}
