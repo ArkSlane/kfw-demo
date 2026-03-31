@@ -11,7 +11,6 @@ from shared.settings import MONGO_URL, DB_NAME, CORS_ORIGINS, LOG_LEVEL, LOG_FOR
 from shared.logging_config import setup_logging, get_logger
 from shared.auth import setup_auth
 from shared.rate_limit import setup_rate_limiting
-from shared.correlation import setup_correlation
 from shared.indexes import ensure_indexes
 from pydantic import BaseModel, Field
 from typing import Optional, Literal
@@ -90,42 +89,39 @@ def _normalize_script_for_playwright_mcp(script: str) -> str:
 VIDEO_RETENTION_DAYS = int(os.getenv("VIDEO_RETENTION_DAYS", "30"))
 CLEANUP_INTERVAL_HOURS = int(os.getenv("CLEANUP_INTERVAL_HOURS", "24"))
 
-def _scan_and_delete_old_videos(videos_dir: str, retention_days: int) -> int:
-    """Blocking file scan + delete — runs in a thread pool via asyncio.to_thread()."""
-    videos_path = Path(videos_dir)
-    if not videos_path.exists():
-        return 0
-    cutoff_time = datetime.now(timezone.utc) - timedelta(days=retention_days)
-    deleted_count = 0
-    for video_file in videos_path.glob("*.webm"):
-        try:
-            file_mtime = datetime.fromtimestamp(video_file.stat().st_mtime, tz=timezone.utc)
-            if file_mtime < cutoff_time:
-                video_file.unlink()
-                deleted_count += 1
-        except Exception as e:
-            logger.error("Error deleting video %s: %s", video_file.name, e)
-    return deleted_count
-
-
 async def cleanup_old_videos():
-    """Background task to delete videos older than VIDEO_RETENTION_DAYS.
-
-    File I/O is offloaded to a thread via asyncio.to_thread() so the event
-    loop is never blocked by directory scans or unlink() calls.
-    """
+    """Background task to delete videos older than VIDEO_RETENTION_DAYS"""
     while True:
         try:
-            deleted_count = await asyncio.to_thread(
-                _scan_and_delete_old_videos, VIDEOS_DIR, VIDEO_RETENTION_DAYS
-            )
+            videos_path = Path(VIDEOS_DIR)
+            if not videos_path.exists():
+                await asyncio.sleep(CLEANUP_INTERVAL_HOURS * 3600)
+                continue
+            
+            cutoff_time = datetime.now(timezone.utc) - timedelta(days=VIDEO_RETENTION_DAYS)
+            deleted_count = 0
+            
+            for video_file in videos_path.glob("*.webm"):
+                try:
+                    # Get file modification time
+                    file_mtime = datetime.fromtimestamp(video_file.stat().st_mtime, tz=timezone.utc)
+                    
+                    if file_mtime < cutoff_time:
+                        video_file.unlink()
+                        deleted_count += 1
+                        logger.info(f"Deleted old video: {video_file.name} (age: {(datetime.now(timezone.utc) - file_mtime).days} days)")
+                except Exception as e:
+                    logger.error(f"Error deleting video {video_file.name}: {e}")
+            
             if deleted_count > 0:
-                logger.info("Video cleanup completed: %d video(s) deleted", deleted_count)
+                logger.info(f"Video cleanup completed: {deleted_count} video(s) deleted")
             else:
                 logger.info("Video cleanup completed: No old videos to delete")
+                
         except Exception as e:
-            logger.error("Error in video cleanup task: %s", e)
-
+            logger.error(f"Error in video cleanup task: {e}")
+        
+        # Sleep until next cleanup interval
         await asyncio.sleep(CLEANUP_INTERVAL_HOURS * 3600)
 
 @asynccontextmanager
@@ -183,7 +179,6 @@ app = FastAPI(
 setup_all_error_handlers(app)
 
 # Production middleware: auth, rate limiting, CORS
-setup_correlation(app)
 setup_auth(app)
 setup_rate_limiting(app)
 app.add_middleware(
@@ -662,7 +657,7 @@ async def get_video_by_filename(video_filename: str):
     This supports previewing recordings before an automation is saved.
     """
     # Basic filename validation to avoid path traversal.
-    if not re.fullmatch(r"[A-Za-z0-9_-]+\.webm", video_filename):
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+\.webm", video_filename):
         raise HTTPException(status_code=400, detail="Invalid video filename")
 
     video_path = os.path.join(VIDEOS_DIR, video_filename)

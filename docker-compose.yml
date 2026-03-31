@@ -13,14 +13,11 @@ services:
   mongo:
     image: mongo:7
     container_name: aitp-mongo
-    # Port NOT exposed to host — services access via internal network only
-    environment:
-      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USERNAME:-aitp}
-      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:?MONGO_ROOT_PASSWORD is required}
+    ports:
+      - "27017:27017"
     volumes:
       - mongo_data:/data/db
     restart: unless-stopped
-    mem_limit: 2g
     healthcheck:
       test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
       interval: 30s
@@ -32,11 +29,11 @@ services:
   redis:
     image: redis:7-alpine
     container_name: aitp-redis
-    # Port NOT exposed to host
+    ports:
+      - "6379:6379"
     volumes:
       - redis_data:/data
     restart: unless-stopped
-    mem_limit: 256m
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 15s
@@ -50,8 +47,8 @@ services:
     container_name: aitp-keycloak
     command: start-dev --import-realm
     environment:
-      - KC_BOOTSTRAP_ADMIN_USERNAME=${KEYCLOAK_ADMIN_USERNAME:-admin}
-      - KC_BOOTSTRAP_ADMIN_PASSWORD=${KEYCLOAK_ADMIN_PASSWORD:?KEYCLOAK_ADMIN_PASSWORD is required}
+      - KC_BOOTSTRAP_ADMIN_USERNAME=admin
+      - KC_BOOTSTRAP_ADMIN_PASSWORD=admin
       - KC_HTTP_PORT=8080
       - KC_HEALTH_ENABLED=true
     ports:
@@ -59,7 +56,6 @@ services:
     volumes:
       - ./keycloak/testmaster-realm.json:/opt/keycloak/data/import/testmaster-realm.json:ro
     restart: unless-stopped
-    mem_limit: 1g
     healthcheck:
       test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/8080 && echo -e 'GET /health/ready HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && cat <&3 | grep -q '200\\|UP'"]
       interval: 30s
@@ -77,13 +73,6 @@ services:
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
     restart: unless-stopped
-    mem_limit: 128m
-    healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost/api/requirements/health"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 30s
     depends_on:
       - frontend
       - requirements
@@ -105,19 +94,12 @@ services:
       context: .
       dockerfile: services/requirements/Dockerfile
     environment:
-      MONGO_URL: mongodb://${MONGO_ROOT_USERNAME:-aitp}:${MONGO_ROOT_PASSWORD}@mongo:27017/?authSource=admin
+      MONGO_URL: mongodb://mongo:27017
       DB_NAME: aitp
       <<: *shared-env
     ports:
       - "8001:8000"
     restart: unless-stopped
-    mem_limit: 512m
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 20s
     depends_on:
       - mongo
       - redis
@@ -130,19 +112,12 @@ services:
       context: .
       dockerfile: services/testcases/Dockerfile
     environment:
-      MONGO_URL: mongodb://${MONGO_ROOT_USERNAME:-aitp}:${MONGO_ROOT_PASSWORD}@mongo:27017/?authSource=admin
+      MONGO_URL: mongodb://mongo:27017
       DB_NAME: aitp
       <<: *shared-env
     ports:
       - "8002:8000"
     restart: unless-stopped
-    mem_limit: 512m
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 20s
     depends_on:
       - mongo
       - redis
@@ -155,7 +130,7 @@ services:
       context: .
       dockerfile: services/generator/Dockerfile
     environment:
-      MONGO_URL: mongodb://${MONGO_ROOT_USERNAME:-aitp}:${MONGO_ROOT_PASSWORD}@mongo:27017/?authSource=admin
+      MONGO_URL: mongodb://mongo:27017
       DB_NAME: aitp
       REQUIREMENTS_SERVICE_URL: http://requirements:8000
       TESTCASES_SERVICE_URL: http://testcases:8000
@@ -176,13 +151,6 @@ services:
     ports:
       - "8003:8000"
     restart: unless-stopped
-    mem_limit: 1g
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 20s
     depends_on:
       - mongo
       - redis
@@ -198,19 +166,12 @@ services:
       context: .
       dockerfile: services/releases/Dockerfile
     environment:
-      MONGO_URL: mongodb://${MONGO_ROOT_USERNAME:-aitp}:${MONGO_ROOT_PASSWORD}@mongo:27017/?authSource=admin
+      MONGO_URL: mongodb://mongo:27017
       DB_NAME: aitp
       <<: *shared-env
     ports:
       - "8004:8000"
     restart: unless-stopped
-    mem_limit: 512m
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 20s
     depends_on:
       - mongo
       - redis
@@ -223,19 +184,12 @@ services:
       context: .
       dockerfile: services/executions/Dockerfile
     environment:
-      MONGO_URL: mongodb://${MONGO_ROOT_USERNAME:-aitp}:${MONGO_ROOT_PASSWORD}@mongo:27017/?authSource=admin
+      MONGO_URL: mongodb://mongo:27017
       DB_NAME: aitp
       <<: *shared-env
     ports:
       - "8005:8000"
     restart: unless-stopped
-    mem_limit: 512m
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 20s
     depends_on:
       - mongo
       - redis
@@ -248,19 +202,12 @@ services:
       context: .
       dockerfile: services/toabrkia/Dockerfile
     environment:
-      MONGO_URL: mongodb://${MONGO_ROOT_USERNAME:-aitp}:${MONGO_ROOT_PASSWORD}@mongo:27017/?authSource=admin
+      MONGO_URL: mongodb://mongo:27017
       DB_NAME: aitp
       <<: *shared-env
     ports:
       - "8008:8000"
     restart: unless-stopped
-    mem_limit: 512m
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 20s
     depends_on:
       - mongo
       - redis
@@ -273,7 +220,7 @@ services:
       context: .
       dockerfile: services/orchestrator/Dockerfile
     environment:
-      MONGO_URL: mongodb://${MONGO_ROOT_USERNAME:-aitp}:${MONGO_ROOT_PASSWORD}@mongo:27017/?authSource=admin
+      MONGO_URL: mongodb://mongo:27017
       DB_NAME: aitp
       REQUIREMENTS_SERVICE_URL: http://requirements:8000
       TESTCASES_SERVICE_URL: http://testcases:8000
@@ -285,13 +232,6 @@ services:
     ports:
       - "8010:8000"
     restart: unless-stopped
-    mem_limit: 512m
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 20s
     depends_on:
       - mongo
       - redis
@@ -319,13 +259,6 @@ services:
     ports:
       - "8009:8000"
     restart: unless-stopped
-    mem_limit: 512m
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 20s
     depends_on:
       - testcases
       - generator
@@ -340,7 +273,7 @@ services:
       context: .
       dockerfile: services/automations/Dockerfile
     environment:
-      MONGO_URL: mongodb://${MONGO_ROOT_USERNAME:-aitp}:${MONGO_ROOT_PASSWORD}@mongo:27017/?authSource=admin
+      MONGO_URL: mongodb://mongo:27017
       DB_NAME: aitp
       PLAYWRIGHT_MCP_URL: http://playwright-mcp-agent:3000
       EXECUTIONS_SERVICE_URL: http://executions:8000
@@ -349,13 +282,6 @@ services:
     ports:
       - "8006:8000"
     restart: unless-stopped
-    mem_limit: 512m
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 20s
     volumes:
       - automation_videos:/videos
     depends_on:
@@ -386,13 +312,6 @@ services:
     ports:
       - "8007:8000"
     restart: unless-stopped
-    mem_limit: 512m
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 20s
     volumes:
       - git_workspace:/workspace
       - git_ssh_keys:/ssh-keys
@@ -430,7 +349,6 @@ services:
     networks:
       - app-network
     restart: unless-stopped
-    mem_limit: 2g
     healthcheck: &pw-health
       test: ["CMD", "curl", "-f", "http://localhost:8931/health"]
       interval: 20s
@@ -450,7 +368,6 @@ services:
     networks:
       - app-network
     restart: unless-stopped
-    mem_limit: 2g
     healthcheck: *pw-health
 
   playwright-mcp-core-3:
@@ -466,7 +383,6 @@ services:
     networks:
       - app-network
     restart: unless-stopped
-    mem_limit: 2g
     healthcheck: *pw-health
 
   playwright-mcp-agent:
@@ -487,7 +403,6 @@ services:
     networks:
       - app-network
     restart: unless-stopped
-    mem_limit: 256m
     depends_on:
       - playwright-mcp-core-1
       - playwright-mcp-core-2
@@ -504,15 +419,13 @@ services:
       context: ./frontend
       dockerfile: Dockerfile
     ports:
-      - "5173:80"
+      - "5173:5173"
     restart: unless-stopped
-    mem_limit: 256m
-    healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost/"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 15s
+    volumes:
+      - ./frontend/src:/app/src
+      - ./frontend/index.html:/app/index.html
+      - ./frontend/vite.config.js:/app/vite.config.js
+      - ./frontend/jsconfig.json:/app/jsconfig.json
     depends_on:
       - requirements
       - testcases
@@ -535,7 +448,7 @@ services:
       context: .
       dockerfile: services/orchestrator-v2/Dockerfile
     environment:
-      MONGO_URL: mongodb://${MONGO_ROOT_USERNAME:-aitp}:${MONGO_ROOT_PASSWORD}@mongo:27017/?authSource=admin
+      MONGO_URL: mongodb://mongo:27017
       DB_NAME: aitp
       REQUIREMENTS_SERVICE_URL: http://requirements:8000
       TESTCASES_SERVICE_URL: http://testcases:8000
@@ -547,13 +460,6 @@ services:
     ports:
       - "8011:8000"
     restart: unless-stopped
-    mem_limit: 512m
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 20s
     depends_on:
       - mongo
       - redis
@@ -565,7 +471,7 @@ services:
       context: .
       dockerfile: services/generator-v2/Dockerfile
     environment:
-      MONGO_URL: mongodb://${MONGO_ROOT_USERNAME:-aitp}:${MONGO_ROOT_PASSWORD}@mongo:27017/?authSource=admin
+      MONGO_URL: mongodb://mongo:27017
       DB_NAME: aitp
       REQUIREMENTS_SERVICE_URL: http://requirements:8000
       TESTCASES_SERVICE_URL: http://testcases:8000
@@ -585,13 +491,6 @@ services:
     ports:
       - "8013:8000"
     restart: unless-stopped
-    mem_limit: 1g
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 20s
     depends_on:
       - mongo
       - redis
@@ -613,7 +512,6 @@ services:
     networks:
       - app-network
     restart: unless-stopped
-    mem_limit: 2g
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9867/health"]
       interval: 20s

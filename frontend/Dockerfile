@@ -1,26 +1,19 @@
-# ── Stage 1: Build ────────────────────────────────────────────────────
-FROM node:20-alpine AS builder
+# Development stage with hot reload
+FROM node:20-alpine
 
 WORKDIR /app
 
+# Copy package files
 COPY package.json package-lock.json ./
+
+# Install dependencies
 RUN npm ci
 
+# Copy source code
 COPY . .
-RUN npm run build
 
-# ── Stage 2: Serve ────────────────────────────────────────────────────
-FROM nginx:alpine AS runner
+# Expose port
+EXPOSE 5173
 
-# Remove default nginx config
-RUN rm /etc/nginx/conf.d/default.conf
-
-# Copy built assets
-COPY --from=builder /app/dist /usr/share/nginx/html
-
-# Single-page-app nginx config: all routes fall back to index.html
-COPY nginx.conf /etc/nginx/conf.d/app.conf
-
-EXPOSE 80
-
-CMD ["nginx", "-g", "daemon off;"]
+# Run dev server with hot reload
+CMD ["npm", "run", "dev", "--", "--host", "0.0.0.0"]

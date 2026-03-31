@@ -1,22 +1,32 @@
 import { createApiClient } from './httpClient';
-import { SERVICE_URLS } from './config';
 
-const client = createApiClient(SERVICE_URLS.requirements);
+const API_BASE_URL = 'http://localhost:8001';
+
+const client = createApiClient(API_BASE_URL);
 
 export const requirementsAPI = {
   // List all requirements
   list: async (q = null, limit = 50, skip = 0, review_status = null) => {
-    const params = { limit, skip };
-    if (q) params.q = q;
-    if (review_status) params.review_status = review_status;
-    const response = await client.get('/requirements', { params });
-    return Array.isArray(response.data) ? response.data : response.data.data || [];
+    try {
+      const params = { limit, skip };
+      if (q) params.q = q;
+      if (review_status) params.review_status = review_status;
+      const response = await client.get('/requirements', { params });
+      return Array.isArray(response.data) ? response.data : response.data.data || [];
+    } catch (error) {
+      // Silently fail - services not running yet
+      return [];
+    }
   },
 
   // Get a single requirement
   get: async (requirementId) => {
-    const response = await client.get(`/requirements/${requirementId}`);
-    return response.data;
+    try {
+      const response = await client.get(`/requirements/${requirementId}`);
+      return response.data;
+    } catch (error) {
+      return null;
+    }
   },
 
   // Create a new requirement

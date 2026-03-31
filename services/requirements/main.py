@@ -12,7 +12,6 @@ from shared.logging_config import setup_logging, get_logger
 from shared.auth import setup_auth
 from shared.rate_limit import setup_rate_limiting
 from shared.indexes import ensure_indexes
-from shared.correlation import setup_correlation
 
 logger = get_logger(__name__)
 
@@ -59,8 +58,7 @@ app = FastAPI(
 # Setup standardized error handlers
 setup_all_error_handlers(app)
 
-# Production middleware: correlation IDs, auth, rate limiting, CORS
-setup_correlation(app)
+# Production middleware: auth, rate limiting, CORS
 setup_auth(app)
 setup_rate_limiting(app)
 app.add_middleware(
