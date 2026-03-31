@@ -1,8 +1,7 @@
 import { createApiClient } from './httpClient';
+import { SERVICE_URLS } from './config';
 
-const API_BASE_URL = 'http://localhost:8005';
-
-const client = createApiClient(API_BASE_URL);
+const client = createApiClient(SERVICE_URLS.executions);
 
 export const executionsAPI = {
   list: async (params = {}) => {

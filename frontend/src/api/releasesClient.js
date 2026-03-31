@@ -1,31 +1,21 @@
 import { createApiClient } from './httpClient';
+import { SERVICE_URLS } from './config';
 
-const API_BASE_URL = 'http://localhost:8004';
-
-const client = createApiClient(API_BASE_URL);
+const client = createApiClient(SERVICE_URLS.releases);
 
 export const releasesAPI = {
   // List all releases
   list: async (q = null, limit = 50, skip = 0) => {
-    try {
-      const params = { limit, skip };
-      if (q) params.q = q;
-      const response = await client.get('/releases', { params });
-      return Array.isArray(response.data) ? response.data : response.data.data || [];
-    } catch (error) {
-      // Silently fail - services not running yet
-      return [];
-    }
+    const params = { limit, skip };
+    if (q) params.q = q;
+    const response = await client.get('/releases', { params });
+    return Array.isArray(response.data) ? response.data : response.data.data || [];
   },
 
   // Get a single release
   get: async (releaseId) => {
-    try {
-      const response = await client.get(`/releases/${releaseId}`);
-      return response.data;
-    } catch (error) {
-      return null;
-    }
+    const response = await client.get(`/releases/${releaseId}`);
+    return response.data;
   },
 
   // Create a new release

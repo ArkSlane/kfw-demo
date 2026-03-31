@@ -28,7 +28,6 @@ Keycloak-mode variables:
 """
 import os
 import json
-import hashlib
 import logging
 import urllib.request
 from datetime import datetime, timezone, timedelta
@@ -173,14 +172,15 @@ def _decode_keycloak_token(token: str) -> dict:
         raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
 
 
-# ─── Password hashing (simple SHA-256 + salt — local mode) ─────────────────
+# ─── Password hashing (bcrypt — local mode) ────────────────────────────────
 def _hash_password(password: str) -> str:
-    salt = (AUTH_SECRET_KEY or "default-salt")[:16]
-    return hashlib.sha256(f"{salt}:{password}".encode()).hexdigest()
+    import bcrypt
+    return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
 
 
 def _verify_password(plain: str, hashed: str) -> bool:
-    return _hash_password(plain) == hashed
+    import bcrypt
+    return bcrypt.checkpw(plain.encode(), hashed.encode())
 
 
 # ─── Token helpers ──────────────────────────────────────────────────────────

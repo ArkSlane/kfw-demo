@@ -1,7 +1,7 @@
 import { createApiClient } from './httpClient';
+import { SERVICE_URLS } from './config';
 
-const API_BASE_URL = 'http://localhost:8008';
-const client = createApiClient(API_BASE_URL);
+const client = createApiClient(SERVICE_URLS.toabrkia);
 
 export const releaseAssessmentsAPI = {
   list: async (params = {}) => {
