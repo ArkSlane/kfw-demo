@@ -46,8 +46,11 @@ from llm import (
     LLM_MODEL,
 )
 from automation_graph import AutomationState, get_automation_graph, build_automation_graph
+from git_integration import push_test_to_git
 
 logger = get_logger(__name__)
+
+GIT_SERVICE_URL = os.getenv("GIT_SERVICE_URL", "http://git:8000")
 
 
 def _fwd_headers(request: Request) -> dict:
@@ -62,6 +65,7 @@ TC_URL = os.getenv("TESTCASES_SERVICE_URL", "http://testcases:8000")
 REQ_URL = os.getenv("REQUIREMENTS_SERVICE_URL", "http://requirements:8000")
 ORCHESTRATOR_URL = os.getenv("ORCHESTRATOR_SERVICE_URL", "http://orchestrator:8000")
 INTERNAL_FRONTEND_BASE_URL = os.getenv("INTERNAL_FRONTEND_BASE_URL", "http://frontend:5173")
+PLAYWRIGHT_MCP_CORE_URL = os.getenv("PLAYWRIGHT_MCP_CORE_URL", "http://playwright-mcp-core-1:8931/mcp")
 PINCHTAB_URL = os.getenv("PINCHTAB_URL", "http://pinchtab:9867")
 
 
@@ -248,6 +252,18 @@ class KGAnalyzeRequest(BaseModel):
     base_url: str
 
 
+class PushTestToGitRequest(BaseModel):
+    test_case_id: str
+    title: str
+    script: str
+    repo_connection_id: Optional[str] = None
+    provider: Optional[Literal["github", "gitlab", "azure"]] = None
+    repo_url: Optional[str] = None
+    base_branch: Optional[str] = None
+    ssh_key_name: Optional[str] = None
+    api_token_id: Optional[str] = None
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # Helpers
 # ═════════════════════════════════════════════════════════════════════════════
@@ -419,81 +435,230 @@ async def delete_knowledge_graph(kg_id: str):
 # KG Analysis (PinchTab + LangChain)
 # ═════════════════════════════════════════════════════════════════════════════
 
-async def _pinchtab_snapshot_page(client: httpx.AsyncClient, instance_id: str, url: str) -> dict:
-    try:
-        tab_resp = await client.post(
-            f"{PINCHTAB_URL}/instances/{instance_id}/tabs/open",
-            json={"url": url},
-            timeout=30,
-        )
-        tab_resp.raise_for_status()
-        tab_id = tab_resp.json().get("tabId")
-        await asyncio.sleep(3)
-
-        snap_resp = await client.get(
-            f"{PINCHTAB_URL}/tabs/{tab_id}/snapshot",
-            params={"filter": "interactive", "format": "compact"},
-            timeout=30,
-        )
-        snap_resp.raise_for_status()
-        snapshot = snap_resp.text
-
-        text_resp = await client.get(f"{PINCHTAB_URL}/tabs/{tab_id}/text", timeout=15)
-        page_text = text_resp.text if text_resp.status_code == 200 else ""
-
+async def _pinchtab_start_instance(client: httpx.AsyncClient) -> str:
+    """Start a headless PinchTab browser instance and return the instance ID."""
+    resp = await client.post(
+        f"{PINCHTAB_URL}/instances/start",
+        json={"mode": "headless"},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    inst_id = data.get("id", "")
+    logger.info(f"PinchTab instance started: {inst_id}")
+    # Wait for instance to be ready
+    for _ in range(10):
+        await asyncio.sleep(1)
         try:
-            await client.delete(f"{PINCHTAB_URL}/tabs/{tab_id}", timeout=5)
+            check = await client.get(f"{PINCHTAB_URL}/instances/{inst_id}", timeout=5)
+            if check.status_code == 200 and check.json().get("status") == "running":
+                break
         except Exception:
             pass
+    return inst_id
 
-        return {"url": url, "snapshot": snapshot, "text": page_text}
+
+async def _pinchtab_open_tab(client: httpx.AsyncClient, instance_id: str, url: str) -> str:
+    """Open a new tab in the PinchTab instance and return the tab ID."""
+    resp = await client.post(
+        f"{PINCHTAB_URL}/instances/{instance_id}/tabs/open",
+        json={"url": url},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return data.get("tabId", "")
+
+
+async def _pinchtab_snapshot(client: httpx.AsyncClient, tab_id: str) -> dict:
+    """Get the accessibility tree snapshot from a PinchTab tab."""
+    resp = await client.get(
+        f"{PINCHTAB_URL}/tabs/{tab_id}/snapshot",
+        params={"filter": "interactive"},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+async def _pinchtab_text(client: httpx.AsyncClient, tab_id: str) -> dict:
+    """Get the text content from a PinchTab tab."""
+    resp = await client.get(
+        f"{PINCHTAB_URL}/tabs/{tab_id}/text",
+        params={"mode": "raw"},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+async def _pinchtab_close_tab(client: httpx.AsyncClient, tab_id: str) -> None:
+    """Close a PinchTab tab."""
+    try:
+        await client.delete(f"{PINCHTAB_URL}/tabs/{tab_id}", timeout=10)
+    except Exception:
+        pass
+
+
+async def _pinchtab_stop_instance(client: httpx.AsyncClient, instance_id: str) -> None:
+    """Stop a PinchTab browser instance."""
+    try:
+        await client.post(f"{PINCHTAB_URL}/instances/{instance_id}/stop", timeout=10)
+    except Exception:
+        pass
+
+
+async def _pinchtab_snapshot_page(client: httpx.AsyncClient, instance_id: str, url: str) -> dict:
+    """Navigate to a URL via PinchTab, take a snapshot, return page data."""
+    try:
+        tab_id = await _pinchtab_open_tab(client, instance_id, url)
+        await asyncio.sleep(2)  # Wait for page to load
+
+        snapshot_data = await _pinchtab_snapshot(client, tab_id)
+        text_data = await _pinchtab_text(client, tab_id)
+
+        # Format snapshot nodes as readable text
+        nodes = snapshot_data.get("nodes", [])
+        snapshot_lines = []
+        for node in nodes:
+            ref = node.get("ref", "")
+            role = node.get("role", "")
+            name = node.get("name", "")
+            snapshot_lines.append(f"[{ref}] {role}: {name}")
+        snapshot_text = "\n".join(snapshot_lines)
+
+        await _pinchtab_close_tab(client, tab_id)
+
+        return {
+            "url": url,
+            "snapshot": snapshot_text,
+            "text": text_data.get("text", ""),
+            "title": text_data.get("title", snapshot_data.get("title", "")),
+            "nodes": nodes,
+        }
     except Exception as e:
         logger.warning(f"PinchTab snapshot failed for {url}: {e}")
-        return {"url": url, "snapshot": "", "text": "", "error": str(e)}
+        return {"url": url, "snapshot": "", "text": "", "error": str(e), "nodes": []}
+
+
+def _rewrite_url_for_docker(url: str) -> str:
+    """Rewrite localhost URLs so the Playwright MCP container can reach them."""
+    from urllib.parse import urlparse, urlunparse
+    parsed = urlparse(url)
+    if parsed.hostname in ("localhost", "127.0.0.1"):
+        # Map well-known host ports to Docker service names
+        port = parsed.port
+        host_map = {
+            5173: "frontend",
+        }
+        new_host = host_map.get(port)
+        if new_host:
+            # Service listens on the same port inside Docker
+            parsed = parsed._replace(netloc=f"{new_host}:{port}")
+        else:
+            # Fallback: try host.docker.internal
+            parsed = parsed._replace(netloc=f"host.docker.internal:{port}" if port else "host.docker.internal")
+        return urlunparse(parsed)
+    return url
+
+
+def _sanitize_kg_analysis(parsed: dict) -> dict:
+    """Coerce raw LLM JSON output to match KnowledgeGraphCreate schema types."""
+    result = {}
+
+    # selector_strategy must be a string
+    ss = parsed.get("selector_strategy", "")
+    if isinstance(ss, dict):
+        result["selector_strategy"] = json.dumps(ss)
+    elif isinstance(ss, list):
+        result["selector_strategy"] = ", ".join(str(s) for s in ss)
+    else:
+        result["selector_strategy"] = str(ss) if ss else ""
+
+    # nav_items: list of {label, route}
+    nav = parsed.get("nav_items", [])
+    if isinstance(nav, list):
+        result["nav_items"] = [
+            {"label": str(ni.get("label", "") if isinstance(ni, dict) else ni),
+             "route": str(ni.get("route", "") if isinstance(ni, dict) else "")}
+            for ni in nav
+        ]
+    else:
+        result["nav_items"] = []
+
+    # pages: list of page objects, coerce all fields to correct types
+    pages = parsed.get("pages", [])
+    if isinstance(pages, list):
+        sanitized_pages = []
+        for p in pages:
+            if not isinstance(p, dict):
+                continue
+            sanitized_pages.append({
+                "route": str(p.get("route", "")),
+                "description": str(p.get("description", "")),
+                "key_buttons": [str(b) for b in p.get("key_buttons", [])] if isinstance(p.get("key_buttons"), list) else [],
+                "filters": [str(f) for f in p.get("filters", [])] if isinstance(p.get("filters"), list) else [],
+                "dialogs": [str(d) for d in p.get("dialogs", [])] if isinstance(p.get("dialogs"), list) else [],
+            })
+        result["pages"] = sanitized_pages
+    else:
+        result["pages"] = []
+
+    # common_button_labels: list of strings
+    cbl = parsed.get("common_button_labels", [])
+    if isinstance(cbl, list):
+        result["common_button_labels"] = [str(b) for b in cbl]
+    else:
+        result["common_button_labels"] = []
+
+    # aria_labels: list of strings
+    al = parsed.get("aria_labels", [])
+    if isinstance(al, list):
+        result["aria_labels"] = [str(a) for a in al]
+    else:
+        result["aria_labels"] = []
+
+    return result
 
 
 @app.post("/knowledge-graphs/analyze", tags=["knowledge-graph"])
 async def analyze_for_knowledge_graph(body: KGAnalyzeRequest):
-    """Use PinchTab + LangChain to crawl and extract KG."""
+    """Use PinchTab + LangChain to crawl and extract KG from accessibility tree."""
     from urllib.parse import urljoin
-    base = body.base_url.rstrip("/")
+    original_base = body.base_url.rstrip("/")
+    base = _rewrite_url_for_docker(original_base)
 
     async with httpx.AsyncClient() as client:
+        # Start a PinchTab browser instance
         try:
-            launch_resp = await client.post(
-                f"{PINCHTAB_URL}/instances/launch",
-                json={"name": f"kg-v2-{int(datetime.now(timezone.utc).timestamp())}", "mode": "headless"},
-                timeout=30,
-            )
-            launch_resp.raise_for_status()
-            instance_id = launch_resp.json().get("id")
+            instance_id = await _pinchtab_start_instance(client)
         except Exception as e:
-            raise HTTPException(status_code=502, detail=f"PinchTab launch failed: {e}")
+            raise HTTPException(status_code=502, detail=f"PinchTab instance start failed: {e}")
 
         try:
             landing = await _pinchtab_snapshot_page(client, instance_id, base)
 
-            # Use LangChain to extract links
+            # Use LangChain to extract links from the accessibility snapshot
             link_prompt = (
-                f"From this web page snapshot, extract ALL internal navigation links.\n"
-                f"Base URL: {base}\n\n"
-                f"--- SNAPSHOT ---\n{landing['snapshot'][:6000]}\n"
+                f"From this web page accessibility tree snapshot, extract ALL internal navigation links.\n"
+                f"Base URL: {original_base}\n\n"
+                f"--- ACCESSIBILITY TREE ---\n{landing['snapshot'][:6000]}\n"
                 f"--- PAGE TEXT ---\n{landing['text'][:3000]}\n---\n\n"
-                f"Return ONLY a JSON array of absolute URLs. Example: [\"{base}\", \"{base}/page1\"]"
+                f"Return ONLY a JSON array of absolute URLs. Example: [\"{original_base}\", \"{original_base}/page1\"]"
             )
             try:
                 link_result = await llm_generate(link_prompt, timeout=60)
                 cleaned = _strip_markdown_code_fences(link_result)
                 discovered_urls = json.loads(cleaned)
                 if not isinstance(discovered_urls, list):
-                    discovered_urls = [base]
+                    discovered_urls = [original_base]
             except Exception:
-                discovered_urls = [base]
+                discovered_urls = [original_base]
 
             seen = set()
             unique_urls = []
             for u in discovered_urls:
-                resolved = urljoin(base + "/", u).rstrip("/")
+                resolved = urljoin(original_base + "/", u).rstrip("/")
                 if resolved not in seen:
                     seen.add(resolved)
                     unique_urls.append(resolved)
@@ -501,27 +666,30 @@ async def analyze_for_knowledge_graph(body: KGAnalyzeRequest):
 
             all_snapshots = []
             for page_url in unique_urls:
-                if page_url.rstrip("/") == base:
+                if page_url.rstrip("/") == original_base:
                     all_snapshots.append(landing)
                 else:
-                    all_snapshots.append(await _pinchtab_snapshot_page(client, instance_id, page_url))
+                    # Rewrite each discovered URL for Docker access
+                    docker_url = _rewrite_url_for_docker(page_url)
+                    snap = await _pinchtab_snapshot_page(client, instance_id, docker_url)
+                    # Store the original URL for display
+                    snap["display_url"] = page_url
+                    all_snapshots.append(snap)
         finally:
-            try:
-                await client.delete(f"{PINCHTAB_URL}/instances/{instance_id}", timeout=10)
-            except Exception:
-                pass
+            await _pinchtab_stop_instance(client, instance_id)
 
         # Build combined context and use LangChain for extraction
         pages_context = ""
         for i, snap in enumerate(all_snapshots):
             if snap.get("error") and not snap["snapshot"]:
                 continue
-            pages_context += f"\n===== PAGE {i+1}: {snap['url']} =====\n"
-            pages_context += f"--- Elements ---\n{snap['snapshot'][:3000]}\n"
-            pages_context += f"--- Text ---\n{snap['text'][:1500]}\n"
+            display_url = snap.get("display_url") or snap['url'].replace(base, original_base) if base != original_base else snap['url']
+            pages_context += f"\n===== PAGE {i+1}: {display_url} =====\n"
+            pages_context += f"--- Accessibility Tree ---\n{snap['snapshot'][:3000]}\n"
+            pages_context += f"--- Page Text ---\n{snap['text'][:1500]}\n"
 
         analysis_prompt = (
-            f"Analyze these {len(all_snapshots)} page snapshots and extract a knowledge graph.\n"
+            f"Analyze these {len(all_snapshots)} page accessibility tree snapshots and extract a knowledge graph.\n"
             f"App: {body.app_name}, Framework: {body.framework}, Base URL: {body.base_url}\n\n"
             f"{pages_context[:25000]}\n\n"
             "Return JSON with: selector_strategy, nav_items[{label,route}], "
@@ -531,12 +699,14 @@ async def analyze_for_knowledge_graph(body: KGAnalyzeRequest):
 
         try:
             parsed = await llm_generate_json(analysis_prompt, timeout=180)
+            # Sanitize LLM output to match KnowledgeGraphCreate schema
+            sanitized = _sanitize_kg_analysis(parsed)
             return {"app_name": body.app_name, "framework": body.framework,
-                    "base_url": body.base_url, "pages_crawled": len(all_snapshots), **parsed}
+                    "base_url": original_base, "pages_crawled": len(all_snapshots), **sanitized}
         except json.JSONDecodeError:
             raw = await llm_generate(analysis_prompt, timeout=180)
             return {"app_name": body.app_name, "framework": body.framework,
-                    "base_url": body.base_url, "pages_crawled": len(all_snapshots),
+                    "base_url": original_base, "pages_crawled": len(all_snapshots),
                     "raw_analysis": raw, "nav_items": [], "pages": []}
         except Exception as e:
             raise HTTPException(status_code=502, detail=f"LLM analysis failed: {e}")
@@ -567,16 +737,23 @@ async def generate_structured_testcase(payload: GenerateStructuredRequest, reque
 
     tc = await llm_generate_structured(prompt, StructuredTestcase, timeout=90)
 
+    # Convert structured steps to Gherkin format
+    gherkin_lines = [f"Feature: {tc.title}", "", f"  Scenario: {tc.title}"]
+    for step in tc.steps:
+        gherkin_lines.append(f"    When {step.action}")
+        gherkin_lines.append(f"    Then {step.expected_result}")
+    gherkin_text = "\n".join(gherkin_lines)
+
     # Save to testcases service
     tc_data = {
         "title": tc.title,
-        "description": tc.description,
+        "gherkin": gherkin_text,
         "requirement_id": payload.requirement_id,
-        "priority": tc.priority,
-        "status": "active",
-        "test_type": "manual",
+        "status": "draft",
         "metadata": {
             "description": tc.description,
+            "priority": tc.priority,
+            "test_type": "manual",
             "preconditions": "",
             "steps": [s.model_dump() for s in tc.steps],
         },
@@ -624,15 +801,21 @@ async def generate_test_suite(payload: GenerateTestSuiteRequest, request: Reques
     async with httpx.AsyncClient(timeout=30, headers=_fwd_headers(request)) as client:
         for category, tests in [("positive", result.positive_tests), ("negative", result.negative_tests)]:
             for tc in tests:
+                gherkin_lines = [f"Feature: {tc.title}", "", f"  Scenario: {tc.title}"]
+                for step in tc.steps:
+                    gherkin_lines.append(f"    When {step.action}")
+                    gherkin_lines.append(f"    Then {step.expected_result}")
+                gherkin_text = "\n".join(gherkin_lines)
                 tc_data = {
                     "title": tc.title,
-                    "description": tc.description,
+                    "gherkin": gherkin_text,
                     "requirement_id": payload.requirement_id,
-                    "priority": tc.priority,
-                    "status": "active",
-                    "test_type": "manual",
+                    "status": "draft",
                     "metadata": {
                         "description": tc.description,
+                        "priority": tc.priority,
+                        "test_type": "manual",
+                        "category": category,
                         "preconditions": "",
                         "steps": [s.model_dump() for s in tc.steps],
                     },
@@ -649,6 +832,8 @@ async def generate_test_suite(payload: GenerateTestSuiteRequest, request: Reques
     return {
         "requirement_id": payload.requirement_id,
         "model": LLM_MODEL,
+        "positive_tests": [t.model_dump() for t in result.positive_tests],
+        "negative_tests": [t.model_dump() for t in result.negative_tests],
         "positive_count": len(result.positive_tests),
         "negative_count": len(result.negative_tests),
         "saved_ids": saved_ids,
@@ -915,6 +1100,93 @@ async def execute_script_debug(payload: dict):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# Git integration: push test to repo
+# ═════════════════════════════════════════════════════════════════════════════
+
+@app.post("/push-test-to-git", tags=["git"])
+async def push_test_to_git_endpoint(payload: PushTestToGitRequest, request: Request):
+    """Push a saved automation script to the linked test repository and create a PR."""
+    repo_url = payload.repo_url
+    provider = payload.provider
+    base_branch = payload.base_branch
+    ssh_key_name = payload.ssh_key_name
+    repo_path = None
+    api_token_id = payload.api_token_id
+
+    # If a repo_connection_id is provided, look up repo details from the git service
+    if payload.repo_connection_id:
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.get(f"{GIT_SERVICE_URL}/repo-connections")
+                resp.raise_for_status()
+                connections = resp.json()
+                conn = next(
+                    (c for c in connections if c.get("id") == payload.repo_connection_id),
+                    None,
+                )
+                if not conn:
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"Repo connection {payload.repo_connection_id} not found",
+                    )
+                repo_url = repo_url or conn.get("repo_url")
+                provider = provider or conn.get("provider")
+                base_branch = base_branch or conn.get("branch") or "main"
+                ssh_key_name = ssh_key_name or conn.get("ssh_key_name")
+                repo_path = conn.get("repo_path")
+                api_token_id = api_token_id or conn.get("api_token_id")
+        except httpx.HTTPError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Failed to fetch repo connection from git service: {exc}",
+            )
+
+    if not repo_url and not repo_path:
+        raise HTTPException(
+            status_code=400,
+            detail="No repo_url provided and no repo connection found. "
+                   "Please connect a test repository first.",
+        )
+
+    if not provider:
+        raise HTTPException(
+            status_code=400, detail="Git provider could not be determined."
+        )
+
+    # Map provider names (repo connections use 'azureDevOps', push_test_to_git expects 'azure')
+    provider_map = {"azureDevOps": "azure", "github": "github", "gitlab": "gitlab"}
+    mapped_provider = provider_map.get(provider, provider)
+    if mapped_provider not in ("github", "gitlab", "azure"):
+        raise HTTPException(status_code=400, detail=f"Unsupported git provider: {provider}")
+
+    try:
+        result = await push_test_to_git(
+            test_case_id=payload.test_case_id,
+            test_title=payload.title,
+            script_content=payload.script,
+            provider=mapped_provider,
+            repo_url=repo_url,
+            base_branch=base_branch or "main",
+            ssh_key_name=ssh_key_name,
+            auth_headers=_fwd_headers(request),
+            repo_path=repo_path,
+            api_token_id=api_token_id,
+        )
+        return result
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except httpx.HTTPStatusError as exc:
+        logger.error("Git push failed: %s — %s", exc.response.status_code, exc.response.text)
+        raise HTTPException(
+            status_code=502,
+            detail=f"Git operation failed: {exc.response.text}",
+        )
+    except Exception as exc:
+        logger.exception("Unexpected error pushing test to git")
+        raise HTTPException(status_code=500, detail=f"Push to git failed: {exc}")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # v2-only: Graph introspection
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -947,7 +1219,8 @@ async def list_graphs():
 async def health():
     llm = await check_azure_llm(AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY)
     mcp = await check_playwright_mcp(PLAYWRIGHT_MCP_URL)
-    deps = {"azure_llm": llm, "playwright_mcp": mcp}
+    pinchtab = await check_http_service(PINCHTAB_URL + "/health", "pinchtab")
+    deps = {"azure_llm": llm, "playwright_mcp": mcp, "pinchtab": pinchtab}
     status = aggregate_health_status(deps)
     return {
         "service": "generator-v2",

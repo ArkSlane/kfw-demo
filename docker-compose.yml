@@ -75,167 +75,35 @@ services:
     restart: unless-stopped
     depends_on:
       - frontend
-      - requirements
-      - testcases
-      - generator
-      - releases
-      - executions
-      - automations
+      - core
+      - generator-v2
       - testcase-migration
-      - toabrkia
       - git
-      - orchestrator
+      - orchestrator-v2
     networks:
       - app-network
 
   # ── Backend services ──────────────────────────────────────────────────
-  requirements:
+  core:
     build:
       context: .
-      dockerfile: services/requirements/Dockerfile
+      dockerfile: services/core/Dockerfile
     environment:
       MONGO_URL: mongodb://mongo:27017
       DB_NAME: aitp
+      PLAYWRIGHT_MCP_URL: http://playwright-mcp-agent:3000
+      AUTH_PUBLIC_PATHS: "/health,/docs,/redoc,/openapi.json,/auth/login,/auth/register,/auth/settings,/videos,/automations/*/video"
       <<: *shared-env
     ports:
       - "8001:8000"
     restart: unless-stopped
+    volumes:
+      - automation_videos:/videos
     depends_on:
       - mongo
       - redis
       - keycloak
-    networks:
-      - app-network
-
-  testcases:
-    build:
-      context: .
-      dockerfile: services/testcases/Dockerfile
-    environment:
-      MONGO_URL: mongodb://mongo:27017
-      DB_NAME: aitp
-      <<: *shared-env
-    ports:
-      - "8002:8000"
-    restart: unless-stopped
-    depends_on:
-      - mongo
-      - redis
-      - keycloak
-    networks:
-      - app-network
-
-  generator:
-    build:
-      context: .
-      dockerfile: services/generator/Dockerfile
-    environment:
-      MONGO_URL: mongodb://mongo:27017
-      DB_NAME: aitp
-      REQUIREMENTS_SERVICE_URL: http://requirements:8000
-      TESTCASES_SERVICE_URL: http://testcases:8000
-      RELEASES_SERVICE_URL: http://releases:8000
-      AZURE_OPENAI_ENDPOINT: ${AZURE_OPENAI_ENDPOINT}
-      AZURE_OPENAI_API_KEY: ${AZURE_OPENAI_API_KEY}
-      AZURE_OPENAI_API_VERSION: ${AZURE_OPENAI_API_VERSION:-2024-12-01-preview}
-      AZURE_OPENAI_DEPLOYMENT: ${AZURE_OPENAI_DEPLOYMENT:-gpt-4o}
-      LLM_TEMPERATURE: ${LLM_TEMPERATURE:-0}
-      LLM_TOP_P: ${LLM_TOP_P:-1}
-      LLM_MAX_TOKENS: ${LLM_MAX_TOKENS:-8192}
-      REJECT_INVALID_GENERATIONS: "true"
-      AUTOMATIONS_SERVICE_URL: http://automations:8000
-      PLAYWRIGHT_MCP_URL: http://playwright-mcp-agent:3000
-      ORCHESTRATOR_SERVICE_URL: http://orchestrator:8000
-      PINCHTAB_URL: http://pinchtab:9867
-      <<: *shared-env
-    ports:
-      - "8003:8000"
-    restart: unless-stopped
-    depends_on:
-      - mongo
-      - redis
-      - keycloak
-      - requirements
-      - testcases
-      - pinchtab
-    networks:
-      - app-network
-
-  releases:
-    build:
-      context: .
-      dockerfile: services/releases/Dockerfile
-    environment:
-      MONGO_URL: mongodb://mongo:27017
-      DB_NAME: aitp
-      <<: *shared-env
-    ports:
-      - "8004:8000"
-    restart: unless-stopped
-    depends_on:
-      - mongo
-      - redis
-      - keycloak
-    networks:
-      - app-network
-
-  executions:
-    build:
-      context: .
-      dockerfile: services/executions/Dockerfile
-    environment:
-      MONGO_URL: mongodb://mongo:27017
-      DB_NAME: aitp
-      <<: *shared-env
-    ports:
-      - "8005:8000"
-    restart: unless-stopped
-    depends_on:
-      - mongo
-      - redis
-      - keycloak
-    networks:
-      - app-network
-
-  toabrkia:
-    build:
-      context: .
-      dockerfile: services/toabrkia/Dockerfile
-    environment:
-      MONGO_URL: mongodb://mongo:27017
-      DB_NAME: aitp
-      <<: *shared-env
-    ports:
-      - "8008:8000"
-    restart: unless-stopped
-    depends_on:
-      - mongo
-      - redis
-      - keycloak
-    networks:
-      - app-network
-
-  orchestrator:
-    build:
-      context: .
-      dockerfile: services/orchestrator/Dockerfile
-    environment:
-      MONGO_URL: mongodb://mongo:27017
-      DB_NAME: aitp
-      REQUIREMENTS_SERVICE_URL: http://requirements:8000
-      TESTCASES_SERVICE_URL: http://testcases:8000
-      GENERATOR_SERVICE_URL: http://generator:8000
-      RELEASES_SERVICE_URL: http://releases:8000
-      AUTOMATIONS_SERVICE_URL: http://automations:8000
-      EXECUTIONS_SERVICE_URL: http://executions:8000
-      <<: *shared-env
-    ports:
-      - "8010:8000"
-    restart: unless-stopped
-    depends_on:
-      - mongo
-      - redis
-      - keycloak
+      - playwright-mcp-agent
     networks:
       - app-network
 
@@ -244,9 +112,9 @@ services:
       context: .
       dockerfile: services/testcase-migration/Dockerfile
     environment:
-      TESTCASES_SERVICE_URL: http://testcases:8000
-      GENERATOR_SERVICE_URL: http://generator:8000
-      AUTOMATIONS_SERVICE_URL: http://automations:8000
+      TESTCASES_SERVICE_URL: http://core:8000
+      GENERATOR_SERVICE_URL: http://generator-v2:8000
+      AUTOMATIONS_SERVICE_URL: http://core:8000
       AZURE_OPENAI_ENDPOINT: ${AZURE_OPENAI_ENDPOINT}
       AZURE_OPENAI_API_KEY: ${AZURE_OPENAI_API_KEY}
       AZURE_OPENAI_API_VERSION: ${AZURE_OPENAI_API_VERSION:-2024-12-01-preview}
@@ -260,36 +128,10 @@ services:
       - "8009:8000"
     restart: unless-stopped
     depends_on:
-      - testcases
-      - generator
-      - automations
+      - core
+      - generator-v2
       - redis
       - keycloak
-    networks:
-      - app-network
-
-  automations:
-    build:
-      context: .
-      dockerfile: services/automations/Dockerfile
-    environment:
-      MONGO_URL: mongodb://mongo:27017
-      DB_NAME: aitp
-      PLAYWRIGHT_MCP_URL: http://playwright-mcp-agent:3000
-      EXECUTIONS_SERVICE_URL: http://executions:8000
-      AUTH_PUBLIC_PATHS: "/health,/docs,/redoc,/openapi.json,/auth/login,/auth/register,/auth/settings,/videos,/automations/*/video"
-      <<: *shared-env
-    ports:
-      - "8006:8000"
-    restart: unless-stopped
-    volumes:
-      - automation_videos:/videos
-    depends_on:
-      - mongo
-      - redis
-      - keycloak
-      - playwright-mcp-agent
-      - executions
     networks:
       - app-network
 
@@ -321,13 +163,37 @@ services:
     networks:
       - app-network
 
-  # ── Playwright pool (3 browser instances) ─────────────────────────────
+  # ── PinchTab (browser control for AI agents) ───────────────────────────
+  pinchtab:
+    image: pinchtab/pinchtab:latest
+    container_name: pinchtab
+    ports:
+      - "9867:9867"
+    environment:
+      PINCHTAB_CONFIG: /data/config.json
+    volumes:
+      - ./pinchtab/config.json:/data/config.json:ro
+      - pinchtab_data:/data
+      - automation_videos:/videos
+    shm_size: "2g"
+    security_opt:
+      - seccomp=unconfined
+    networks:
+      - app-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "pinchtab", "health"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+
+  # ── Playwright MCP (kept for automation execution) ────────────────────
   playwright-mcp-core-1:
     image: mcr.microsoft.com/playwright/mcp:latest
     container_name: playwright-mcp-core-1
     user: "0:0"
     entrypoint: ["node"]
-    command: &pw-cmd
+    command:
       - cli.js
       - --headless
       - --browser
@@ -349,41 +215,11 @@ services:
     networks:
       - app-network
     restart: unless-stopped
-    healthcheck: &pw-health
+    healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8931/health"]
       interval: 20s
       timeout: 5s
       retries: 3
-
-  playwright-mcp-core-2:
-    image: mcr.microsoft.com/playwright/mcp:latest
-    container_name: playwright-mcp-core-2
-    user: "0:0"
-    entrypoint: ["node"]
-    command: *pw-cmd
-    ports:
-      - "8932:8931"
-    volumes:
-      - automation_videos:/videos
-    networks:
-      - app-network
-    restart: unless-stopped
-    healthcheck: *pw-health
-
-  playwright-mcp-core-3:
-    image: mcr.microsoft.com/playwright/mcp:latest
-    container_name: playwright-mcp-core-3
-    user: "0:0"
-    entrypoint: ["node"]
-    command: *pw-cmd
-    ports:
-      - "8933:8931"
-    volumes:
-      - automation_videos:/videos
-    networks:
-      - app-network
-    restart: unless-stopped
-    healthcheck: *pw-health
 
   playwright-mcp-agent:
     build:
@@ -397,16 +233,14 @@ services:
     environment:
       - VIDEO_PATH=/videos
       - PORT=3000
-      # Comma-separated pool of Playwright MCP core URLs
-      - PLAYWRIGHT_MCP_POOL=http://playwright-mcp-core-1:8931/mcp,http://playwright-mcp-core-2:8931/mcp,http://playwright-mcp-core-3:8931/mcp
+      # Playwright MCP core URL
+      - PLAYWRIGHT_MCP_POOL=http://playwright-mcp-core-1:8931/mcp
       - PLAYWRIGHT_MCP_OFFICIAL_URL=http://playwright-mcp-core-1:8931/mcp
     networks:
       - app-network
     restart: unless-stopped
     depends_on:
       - playwright-mcp-core-1
-      - playwright-mcp-core-2
-      - playwright-mcp-core-3
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://localhost:3000/health').then(r=>{if(!r.ok)throw 1;process.exit(0)}).catch(()=>process.exit(1))"]
       interval: 20s
@@ -427,12 +261,8 @@ services:
       - ./frontend/vite.config.js:/app/vite.config.js
       - ./frontend/jsconfig.json:/app/jsconfig.json
     depends_on:
-      - requirements
-      - testcases
-      - releases
-      - executions
-      - toabrkia
-      - generator
+      - core
+      - generator-v2
       - keycloak
     environment:
       - VITE_API_BASE_URL=http://localhost:8001
@@ -450,12 +280,12 @@ services:
     environment:
       MONGO_URL: mongodb://mongo:27017
       DB_NAME: aitp
-      REQUIREMENTS_SERVICE_URL: http://requirements:8000
-      TESTCASES_SERVICE_URL: http://testcases:8000
+      REQUIREMENTS_SERVICE_URL: http://core:8000
+      TESTCASES_SERVICE_URL: http://core:8000
       GENERATOR_SERVICE_URL: http://generator-v2:8000
-      RELEASES_SERVICE_URL: http://releases:8000
-      AUTOMATIONS_SERVICE_URL: http://automations:8000
-      EXECUTIONS_SERVICE_URL: http://executions:8000
+      RELEASES_SERVICE_URL: http://core:8000
+      AUTOMATIONS_SERVICE_URL: http://core:8000
+      EXECUTIONS_SERVICE_URL: http://core:8000
       <<: *shared-env
     ports:
       - "8011:8000"
@@ -473,9 +303,9 @@ services:
     environment:
       MONGO_URL: mongodb://mongo:27017
       DB_NAME: aitp
-      REQUIREMENTS_SERVICE_URL: http://requirements:8000
-      TESTCASES_SERVICE_URL: http://testcases:8000
-      RELEASES_SERVICE_URL: http://releases:8000
+      REQUIREMENTS_SERVICE_URL: http://core:8000
+      TESTCASES_SERVICE_URL: http://core:8000
+      RELEASES_SERVICE_URL: http://core:8000
       AZURE_OPENAI_ENDPOINT: ${AZURE_OPENAI_ENDPOINT}
       AZURE_OPENAI_API_KEY: ${AZURE_OPENAI_API_KEY}
       AZURE_OPENAI_API_VERSION: ${AZURE_OPENAI_API_VERSION:-2024-12-01-preview}
@@ -483,10 +313,12 @@ services:
       LLM_TEMPERATURE: ${LLM_TEMPERATURE:-0}
       LLM_TOP_P: ${LLM_TOP_P:-1}
       LLM_MAX_TOKENS: ${LLM_MAX_TOKENS:-8192}
-      AUTOMATIONS_SERVICE_URL: http://automations:8000
+      AUTOMATIONS_SERVICE_URL: http://core:8000
       PLAYWRIGHT_MCP_URL: http://playwright-mcp-agent:3000
       ORCHESTRATOR_SERVICE_URL: http://orchestrator-v2:8000
+      PLAYWRIGHT_MCP_CORE_URL: http://playwright-mcp-core-1:8931/mcp
       PINCHTAB_URL: http://pinchtab:9867
+      GIT_SERVICE_URL: http://git:8000
       <<: *shared-env
     ports:
       - "8013:8000"
@@ -494,29 +326,13 @@ services:
     depends_on:
       - mongo
       - redis
-      - requirements
-      - testcases
+      - core
+      - git
+      - playwright-mcp-core-1
       - pinchtab
     networks:
       - app-network
 
-  # ── PinchTab — AI browser automation for page analysis ─────────────
-  pinchtab:
-    image: pinchtab/pinchtab:latest
-    container_name: pinchtab
-    ports:
-      - "9867:9867"
-    volumes:
-      - pinchtab_data:/data
-    shm_size: 2g
-    networks:
-      - app-network
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9867/health"]
-      interval: 20s
-      timeout: 5s
-      retries: 3
 
 volumes:
   mongo_data:

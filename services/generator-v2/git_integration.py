@@ -22,7 +22,9 @@ async def push_test_to_git(
     repo_url: str | None = None,
     base_branch: str | None = None,
     ssh_key_name: str | None = None,
-    auth_headers: dict | None = None
+    auth_headers: dict | None = None,
+    repo_path: str | None = None,
+    api_token_id: str | None = None
 ) -> dict:
     """
     Push a generated Playwright test to a Git repository and create a PR/MR.
@@ -36,6 +38,8 @@ async def push_test_to_git(
         base_branch: Base branch to create PR from (uses env var if None)
         ssh_key_name: SSH key name for authentication (optional)
         auth_headers: Authorization headers for service-to-service calls
+        repo_path: Existing repo directory name in git workspace (skips clone/pull)
+        api_token_id: Stored API token ID for authentication (optional)
     
     Returns:
         dict with keys: success, pr_url, branch_name, file_path
@@ -43,38 +47,44 @@ async def push_test_to_git(
     repo_url = repo_url or TESTS_REPO_URL
     base_branch = base_branch or TESTS_REPO_BRANCH
     
-    if not repo_url:
+    if not repo_url and not repo_path:
         raise ValueError("TESTS_REPO_URL environment variable not set and no repo_url provided")
     
     async with httpx.AsyncClient(timeout=120, headers=auth_headers or {}) as client:
-        # 1. Clone repository (or pull if exists)
-        repo_name = Path(repo_url).stem.replace('.git', '')
+        # Use provided repo_path (from connection) or derive from URL
+        repo_name = repo_path or Path(repo_url).stem.replace('.git', '')
+        
+        # Sync: pull latest on base branch (repo already cloned by connection)
+        pull_payload = {
+            "repo_path": repo_name,
+            "branch": base_branch,
+        }
+        if ssh_key_name:
+            pull_payload["ssh_key_name"] = ssh_key_name
+        if api_token_id:
+            pull_payload["api_token_id"] = api_token_id
         
         try:
-            # Try to pull latest changes if repo exists
             pull_resp = await client.post(
                 f"{GIT_SERVICE_URL}/pull",
-                json={
-                    "repo_path": repo_name,
-                    "branch": base_branch,
-                    "ssh_key_name": ssh_key_name
-                }
+                json=pull_payload
             )
             pull_resp.raise_for_status()
-            cloned = False
-        except:
-            # Clone if doesn't exist
-            clone_resp = await client.post(
-                f"{GIT_SERVICE_URL}/clone",
-                json={
-                    "repo_url": repo_url,
-                    "branch": base_branch,
-                    "target_dir": repo_name,
-                    "ssh_key_name": ssh_key_name
-                }
-            )
-            clone_resp.raise_for_status()
-            cloned = True
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404 and repo_url:
+                # Repo not yet on disk — clone it
+                clone_resp = await client.post(
+                    f"{GIT_SERVICE_URL}/clone",
+                    json={
+                        "repo_url": repo_url,
+                        "branch": base_branch,
+                        "target_dir": repo_name,
+                        "ssh_key_name": ssh_key_name
+                    }
+                )
+                clone_resp.raise_for_status()
+            else:
+                raise
         
         # 2. Create feature branch
         timestamp = int(datetime.now(timezone.utc).timestamp())
@@ -124,13 +134,17 @@ async def push_test_to_git(
         commit_resp.raise_for_status()
         
         # 5. Push branch
+        push_payload = {
+            "repo_path": repo_name,
+            "branch": branch_name,
+        }
+        if ssh_key_name:
+            push_payload["ssh_key_name"] = ssh_key_name
+        if api_token_id:
+            push_payload["api_token_id"] = api_token_id
         push_resp = await client.post(
             f"{GIT_SERVICE_URL}/push",
-            json={
-                "repo_path": repo_name,
-                "branch": branch_name,
-                "ssh_key_name": ssh_key_name
-            }
+            json=push_payload
         )
         push_resp.raise_for_status()
         
@@ -167,7 +181,8 @@ npx playwright test {file_path}
                 "target_branch": base_branch,
                 "title": pr_title,
                 "description": pr_description,
-                "provider": provider
+                "provider": provider,
+                "api_token_id": api_token_id
             }
         )
         mr_resp.raise_for_status()
@@ -180,7 +195,6 @@ npx playwright test {file_path}
             "branch_name": branch_name,
             "file_path": file_path,
             "repo_name": repo_name,
-            "cloned": cloned
         }
 
 

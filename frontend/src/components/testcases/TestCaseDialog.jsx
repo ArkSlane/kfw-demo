@@ -425,6 +425,8 @@ export default function TestCaseDialog({ open, onOpenChange, testCase, requireme
                     <SelectItem value="passed">Passed</SelectItem>
                     <SelectItem value="failed">Failed</SelectItem>
                     <SelectItem value="blocked">Blocked</SelectItem>
+                    <SelectItem value="approved">Approved</SelectItem>
+                    <SelectItem value="inactive">Inactive</SelectItem>
                   </SelectContent>
                 </Select>
               </div>

@@ -29,7 +29,7 @@ export default function AutomationReviewDialog({
 
   useEffect(() => {
     if (!open) return;
-    setScript(draft?.script_outline || "");
+    setScript(draft?.script || draft?.script_outline || "");
     setChatInput("");
     setExpandedStep(null);
   }, [open, draft]);

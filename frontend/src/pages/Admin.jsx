@@ -23,13 +23,13 @@ const viteEnv = /** @type {any} */ (import.meta).env;
 
 const DEFAULT_SERVICE_URLS = {
   requirements: viteEnv?.VITE_REQUIREMENTS_URL || "http://localhost:8001",
-  testcases: viteEnv?.VITE_TESTCASES_URL || "http://localhost:8002",
+  testcases: viteEnv?.VITE_TESTCASES_URL || "http://localhost:8001",
   generator: viteEnv?.VITE_GENERATOR_URL || "http://localhost:8013",
-  releases: viteEnv?.VITE_RELEASES_URL || "http://localhost:8004",
-  executions: viteEnv?.VITE_EXECUTIONS_URL || "http://localhost:8005",
-  automations: viteEnv?.VITE_AUTOMATIONS_URL || "http://localhost:8006",
+  releases: viteEnv?.VITE_RELEASES_URL || "http://localhost:8001",
+  executions: viteEnv?.VITE_EXECUTIONS_URL || "http://localhost:8001",
+  automations: viteEnv?.VITE_AUTOMATIONS_URL || "http://localhost:8001",
   git: viteEnv?.VITE_GIT_URL || "http://localhost:8007",
-  toabrkia: viteEnv?.VITE_TOABRKIA_URL || "http://localhost:8008",
+  toabrkia: viteEnv?.VITE_TOABRKIA_URL || "http://localhost:8001",
   testcaseMigration: viteEnv?.VITE_TESTCASE_MIGRATION_URL || "http://localhost:8009",
 };
 
@@ -275,7 +275,9 @@ export default function Admin() {
       // Merge analyzed results into the form
       setKgForm((f) => ({
         ...f,
-        selector_strategy: result.selector_strategy || f.selector_strategy,
+        selector_strategy: typeof result.selector_strategy === 'string'
+          ? (result.selector_strategy || f.selector_strategy)
+          : (result.selector_strategy ? JSON.stringify(result.selector_strategy) : f.selector_strategy),
         nav_items: (result.nav_items || []).map((ni) => ({
           label: ni.label || "",
           route: ni.route || "",

@@ -91,6 +91,16 @@ const generatorAPI = {
     const response = await client.post('/execute-script', payload);
     return response.data;
   },
+
+  pushTestToGit: async ({ test_case_id, title, script, repo_connection_id }) => {
+    const response = await client.post('/push-test-to-git', {
+      test_case_id,
+      title,
+      script,
+      repo_connection_id,
+    });
+    return response.data;
+  },
 };
 
 export default generatorAPI;

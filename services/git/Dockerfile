@@ -38,6 +38,10 @@ ENV PATH=/home/appuser/.local/bin:$PATH
 
 USER appuser
 
+# Configure git identity for commits
+RUN git config --global user.email "testmaster@aitp.local" && \
+    git config --global user.name "TestMaster AI Platform"
+
 # Expose port
 EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 CMD curl -f http://localhost:8000/health || exit 1

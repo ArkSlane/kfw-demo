@@ -58,10 +58,10 @@ export const testExecution = {
  */
 export const API_ENDPOINTS = {
   requirements: 'http://localhost:8001',
-  testcases: 'http://localhost:8002',
-  releases: 'http://localhost:8004',
-  executions: 'http://localhost:8005',
-  automations: 'http://localhost:8006',
+  testcases: 'http://localhost:8001',
+  releases: 'http://localhost:8001',
+  executions: 'http://localhost:8001',
+  automations: 'http://localhost:8001',
 };
 
 /**

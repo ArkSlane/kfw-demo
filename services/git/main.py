@@ -142,11 +142,13 @@ class PushRequest(BaseModel):
     branch: str | None = None
     force: bool = False
     ssh_key_name: str | None = None  # Optional SSH key to use for push
+    api_token_id: str | None = None  # Optional API token for HTTPS auth
 
 class PullRequest(BaseModel):
     repo_path: str
     branch: str | None = None
     ssh_key_name: str | None = None  # Optional SSH key to use for pull
+    api_token_id: str | None = None  # Optional API token for HTTPS auth
 
 class MergeRequestCreate(BaseModel):
     repo_path: str
@@ -379,58 +381,92 @@ async def pull_changes(payload: PullRequest):
     """Pull latest changes from remote."""
     repo_path = get_repo_path(payload.repo_path)
     
-    # Configure SSH if key is provided
-    if payload.ssh_key_name:
-        ssh_manager.configure_git_ssh(payload.ssh_key_name)
-    
-    # Validate branch name if provided
-    if payload.branch:
-        validate_branch_name(payload.branch)
-    
-    args = ["pull"]
-    if payload.branch:
-        args.extend(["origin", payload.branch])
-    
-    stdout, stderr, code = run_git_command(args, cwd=repo_path)
-    
-    if code != 0:
-        raise HTTPException(status_code=500, detail=f"Pull failed: {stderr}")
-    
-    return {
-        "success": True,
-        "output": stdout,
-        "message": "Changes pulled successfully"
-    }
+    env = None
+    cleanup = None
+    try:
+        # Configure SSH if key is provided
+        if payload.ssh_key_name:
+            ssh_manager.configure_git_ssh(payload.ssh_key_name)
+        elif payload.api_token_id:
+            provider = provider_from_repo_url_safe(repo_path)
+            token = get_provider_token(provider, payload.api_token_id)
+            if token:
+                env, cleanup = build_git_askpass_env(provider, token)
+        
+        # Validate branch name if provided
+        if payload.branch:
+            validate_branch_name(payload.branch)
+        
+        args = ["pull"]
+        if payload.branch:
+            args.extend(["origin", payload.branch])
+        
+        stdout, stderr, code = run_git_command(args, cwd=repo_path, env=env)
+        
+        if code != 0:
+            if payload.api_token_id:
+                try:
+                    secret = api_token_store.get_token_value(payload.api_token_id)
+                    stderr = redact_secret(stderr, secret)
+                except Exception:
+                    pass
+            raise HTTPException(status_code=500, detail=f"Pull failed: {stderr}")
+        
+        return {
+            "success": True,
+            "output": stdout,
+            "message": "Changes pulled successfully"
+        }
+    finally:
+        if cleanup:
+            cleanup()
 
 @app.post("/push")
 async def push_changes(payload: PushRequest):
     """Push local changes to remote."""
     repo_path = get_repo_path(payload.repo_path)
     
-    # Configure SSH if key is provided
-    if payload.ssh_key_name:
-        ssh_manager.configure_git_ssh(payload.ssh_key_name)
-    
-    # Validate branch name if provided
-    if payload.branch:
-        validate_branch_name(payload.branch)
-    
-    args = ["push"]
-    if payload.force:
-        args.append("--force")
-    if payload.branch:
-        args.extend(["origin", payload.branch])
-    
-    stdout, stderr, code = run_git_command(args, cwd=repo_path)
-    
-    if code != 0:
-        raise HTTPException(status_code=500, detail=f"Push failed: {stderr}")
-    
-    return {
-        "success": True,
-        "output": stdout,
-        "message": "Changes pushed successfully"
-    }
+    env = None
+    cleanup = None
+    try:
+        # Configure SSH if key is provided
+        if payload.ssh_key_name:
+            ssh_manager.configure_git_ssh(payload.ssh_key_name)
+        elif payload.api_token_id:
+            provider = provider_from_repo_url_safe(repo_path)
+            token = get_provider_token(provider, payload.api_token_id)
+            if token:
+                env, cleanup = build_git_askpass_env(provider, token)
+        
+        # Validate branch name if provided
+        if payload.branch:
+            validate_branch_name(payload.branch)
+        
+        args = ["push"]
+        if payload.force:
+            args.append("--force")
+        if payload.branch:
+            args.extend(["origin", payload.branch])
+        
+        stdout, stderr, code = run_git_command(args, cwd=repo_path, env=env)
+        
+        if code != 0:
+            if payload.api_token_id:
+                try:
+                    secret = api_token_store.get_token_value(payload.api_token_id)
+                    stderr = redact_secret(stderr, secret)
+                except Exception:
+                    pass
+            raise HTTPException(status_code=500, detail=f"Push failed: {stderr}")
+        
+        return {
+            "success": True,
+            "output": stdout,
+            "message": "Changes pushed successfully"
+        }
+    finally:
+        if cleanup:
+            cleanup()
 
 @app.post("/fetch")
 async def fetch_remote(payload: GitStatusRequest):
@@ -1141,6 +1177,14 @@ def provider_from_repo_url(repo_url: str) -> Literal["github", "gitlab", "azure"
         return "gitlab"
     if "dev.azure.com" in url or "visualstudio.com" in url:
         return "azure"
+    return "unknown"
+
+
+def provider_from_repo_url_safe(repo_path: Path) -> Literal["github", "gitlab", "azure", "unknown"]:
+    """Determine provider by reading the remote origin URL from a local repo."""
+    stdout, _, code = run_git_command(["config", "--get", "remote.origin.url"], cwd=repo_path)
+    if code == 0 and stdout.strip():
+        return provider_from_repo_url(stdout.strip())
     return "unknown"
 
 

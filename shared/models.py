@@ -31,10 +31,10 @@ class RequirementOut(RequirementCreate):
     updated_at: datetime
 
 # ---------- Testcases ----------
-TestcaseStatus = Literal["draft", "ready", "passed", "failed", "approved", "inactive"]
+TestcaseStatus = Literal["draft", "ready", "in_progress", "passed", "failed", "approved", "inactive", "blocked"]
 
 class TestcaseCreate(BaseModel):
-    requirement_id: str = Field(..., max_length=50)
+    requirement_id: Optional[str] = Field(None, max_length=50)
     title: str = Field(..., max_length=500)
     gherkin: str = Field(..., max_length=100000)
     status: TestcaseStatus = "draft"

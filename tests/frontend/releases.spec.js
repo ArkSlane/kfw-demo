@@ -79,12 +79,12 @@ test.describe('Releases Page - Create & Edit', () => {
     await expect(page.locator('text=E2E Minimal Release').first()).toBeVisible({ timeout: 10000 });
     
     // Get the created release ID for cleanup
-    const releasesResponse = await request.get('http://localhost:8004/releases');
+    const releasesResponse = await request.get('http://localhost:8001/releases');
     const releases = await releasesResponse.json();
     const createdRelease = Array.isArray(releases) ? releases.find(r => r.name === 'E2E Minimal Release') : null;
     
     if (createdRelease) {
-      await request.delete(`http://localhost:8004/releases/${createdRelease.id}`);
+      await request.delete(`http://localhost:8001/releases/${createdRelease.id}`);
     }
   });
 
@@ -119,7 +119,7 @@ test.describe('Releases Page - Create & Edit', () => {
     await expect(page.locator('text=Test release description').first()).toBeVisible();
     
     // Get the created release ID for cleanup from API
-    const releasesResponse = await request.get('http://localhost:8004/releases');
+    const releasesResponse = await request.get('http://localhost:8001/releases');
     const releases = await releasesResponse.json();
     const createdRelease = Array.isArray(releases) ? releases.find(r => r.name === 'E2E Test Release v1.0') : null;
     
@@ -204,12 +204,12 @@ test.describe('Releases Page - Create & Edit', () => {
     await expect(page.locator(`text=${specialName}`).first()).toBeVisible({ timeout: 10000 });
     
     // Cleanup
-    const releasesResponse = await request.get('http://localhost:8004/releases');
+    const releasesResponse = await request.get('http://localhost:8001/releases');
     const releases = await releasesResponse.json();
     const createdRelease = Array.isArray(releases) ? releases.find(r => r.name === specialName) : null;
     
     if (createdRelease) {
-      await request.delete(`http://localhost:8004/releases/${createdRelease.id}`);
+      await request.delete(`http://localhost:8001/releases/${createdRelease.id}`);
     }
   });
 
@@ -265,12 +265,12 @@ test.describe('Releases Page - Create & Edit', () => {
     await expect(page.locator('text=Updated description').first()).toBeVisible();
     
     // Cleanup
-    const releasesResponse = await request.get('http://localhost:8004/releases');
+    const releasesResponse = await request.get('http://localhost:8001/releases');
     const releases = await releasesResponse.json();
     const createdRelease = Array.isArray(releases) ? releases.find(r => r.name === 'E2E Edit Test Release Updated') : null;
     
     if (createdRelease) {
-      await request.delete(`http://localhost:8004/releases/${createdRelease.id}`);
+      await request.delete(`http://localhost:8001/releases/${createdRelease.id}`);
     }
   });
 });
@@ -290,7 +290,7 @@ test.describe('Releases Page - Display & Details', () => {
     const requirement = await createTestRequirement(request, release.id);
     
     // Update release to include the requirement in requirement_ids array
-    await request.patch(`http://localhost:8004/releases/${release.id}`, {
+    await request.patch(`http://localhost:8001/releases/${release.id}`, {
       data: {
         requirement_ids: [requirement.id],
       },
@@ -401,7 +401,7 @@ test.describe('Releases Page - Display & Details', () => {
     const requirement = await createTestRequirement(request, release.id);
     
     // Update release to include the requirement
-    await request.patch(`http://localhost:8004/releases/${release.id}`, {
+    await request.patch(`http://localhost:8001/releases/${release.id}`, {
       data: {
         requirement_ids: [requirement.id],
       },
@@ -428,7 +428,7 @@ test.describe('Releases Page - Display & Details', () => {
     
     // Cleanup
     await request.delete(`http://localhost:8001/requirements/${requirement.id}`);
-    await request.delete(`http://localhost:8004/releases/${release.id}`);
+    await request.delete(`http://localhost:8001/releases/${release.id}`);
   });
 
   test('should show loading state', async ({ page }) => {
@@ -478,7 +478,7 @@ test.describe('Releases Page - Actions', () => {
     await expect(deleteButton).toBeVisible();
     
     // Cleanup
-    await request.delete(`http://localhost:8004/releases/${release.id}`);
+    await request.delete(`http://localhost:8001/releases/${release.id}`);
   });
 
   test.skip('should open delete confirmation dialog', async ({ page, request }) => {
@@ -518,7 +518,7 @@ test.describe('Releases Page - Actions', () => {
     await page.waitForTimeout(500);
     
     // Cleanup
-    await request.delete(`http://localhost:8004/releases/${release.id}`);
+    await request.delete(`http://localhost:8001/releases/${release.id}`);
   });
 
   test.skip('should delete release after confirmation', async ({ page, request }) => {
@@ -591,7 +591,7 @@ test.describe('Releases Page - Actions', () => {
     await page.waitForTimeout(300);
     
     // Cleanup
-    await request.delete(`http://localhost:8004/releases/${release.id}`);
+    await request.delete(`http://localhost:8001/releases/${release.id}`);
   });
 });
 

@@ -8,6 +8,7 @@ import generatorAPI from "@/api/generatorClient";
 import automationsAPI from "@/api/automationsClient";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useAuth } from "@/lib/AuthContext";
+import { useAppRepo } from "@/lib/AppRepoContext";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -55,6 +56,7 @@ export default function TestCases() {
   const [pageTab, setPageTab] = useState("current");
   const queryClient = useQueryClient();
   const { user } = useAuth();
+  const { linkedTestRepo } = useAppRepo();
 
   const transformTestCaseFromBackend = (tc) => {
     // Transform backend format back to frontend format
@@ -218,11 +220,14 @@ export default function TestCases() {
     }
 
     // Transform frontend data to backend schema
+    const validStatuses = ['draft', 'ready', 'in_progress', 'passed', 'failed', 'approved', 'inactive', 'blocked'];
+    const backendStatus = validStatuses.includes(data.status) ? data.status : 'draft';
+
     const payload = {
-      requirement_id: data.requirement_ids?.[0] || '', // backend expects singular requirement_id
+      requirement_id: data.requirement_ids?.[0] || null, // backend accepts null for optional requirement_id
       title: data.title,
       gherkin: gherkin,
-      status: data.status || 'draft',
+      status: backendStatus,
       version: 1,
       metadata: {
         priority: data.priority || 'medium',
@@ -409,7 +414,7 @@ export default function TestCases() {
         script,
         status: automationDraft.exec_success ? 'not_started' : 'blocked',
         notes: automationDraft.notes,
-        last_actions: automationDraft.actions_taken || null,
+        last_actions: automationDraft.actions_taken || automationDraft.transcript || null,
         metadata: automationDraft.metadata || {},
         video_path: automationDraft.video_path || null,
         review_status: 'pending_review',
@@ -430,6 +435,31 @@ export default function TestCases() {
       };
 
       await testcasesAPI.update(automationDraftTestCase.id, updatePayload);
+
+      // Push automation script to the test repository
+      try {
+        if (linkedTestRepo) {
+          const pushResult = await generatorAPI.pushTestToGit({
+            test_case_id: automationDraftTestCase.id,
+            title: automationDraft.title || automationDraftTestCase.title,
+            script,
+            repo_connection_id: linkedTestRepo.id,
+          });
+          if (pushResult?.success) {
+            toast.success('Automation pushed to test repo', {
+              description: pushResult.pr_url
+                ? `PR created: ${pushResult.pr_url}`
+                : `Branch: ${pushResult.branch_name}`,
+            });
+          }
+        }
+      } catch (pushError) {
+        console.error('Push to git error:', pushError);
+        toast.error('Automation saved, but push to repo failed', {
+          description: pushError?.response?.data?.detail || pushError.message,
+        });
+      }
+
       queryClient.invalidateQueries({ queryKey: ['testCases'] });
 
       toast.success('Automation saved');
@@ -719,7 +749,29 @@ export default function TestCases() {
                               Execute
                             </Button>
                           )}
-                          {!hasAutomation && (
+                          {hasAutomation ? (
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              className="gap-2 bg-gradient-to-r from-purple-50 to-blue-50 border-purple-200 hover:from-purple-100 hover:to-blue-100"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                const auto = linkedAutomations[0];
+                                setAutomationDraft(auto);
+                                setAutomationDraftTestCase(test);
+                                setAutomationChatMessages([]);
+                                if (auto.video_filename) {
+                                  setAutomationVideoUrl(`${automationsAPI.getRawVideoUrl(auto.video_filename)}?t=${Date.now()}`);
+                                } else {
+                                  setAutomationVideoUrl(null);
+                                }
+                                setAutomationReviewOpen(true);
+                              }}
+                            >
+                              <Sparkles className="w-3 h-3 text-purple-600" />
+                              Review AI Automation
+                            </Button>
+                          ) : (
                             <Button
                               size="sm"
                               variant="outline"

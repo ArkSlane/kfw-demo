@@ -10,6 +10,7 @@ import { setupIframeMessaging } from './lib/iframe-messaging';
 import PageNotFound from './lib/PageNotFound';
 import { AuthProvider, useAuth } from '@/lib/AuthContext';
 import { DemoSettingsProvider } from '@/lib/DemoSettingsContext';
+import { AppRepoProvider } from '@/lib/AppRepoContext';
 import UserNotRegisteredError from '@/components/UserNotRegisteredError';
 
 const { Pages, Layout, mainPage } = pagesConfig;
@@ -67,8 +68,10 @@ function App() {
     <AuthProvider>
       <QueryClientProvider client={queryClientInstance}>
         <Router>
+          <AppRepoProvider>
           <NavigationTracker />
           <AuthenticatedApp />
+          </AppRepoProvider>
         </Router>
         <Toaster />
         <VisualEditAgent />

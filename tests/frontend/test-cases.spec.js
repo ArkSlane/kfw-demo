@@ -135,7 +135,7 @@ test.describe('Test Cases Page', () => {
 
   test('should display last execution status badge', async ({ page, request }) => {
     // First, create an execution for the test case
-    const executionResponse = await request.post('http://localhost:8005/executions', {
+    const executionResponse = await request.post('http://localhost:8001/executions', {
       data: {
         test_case_id: testIds.testCaseId,
         execution_type: 'manual',
@@ -349,11 +349,11 @@ test.describe('Test Cases Page', () => {
     await expect(page.locator('text=E2E New Test Case').first()).toBeVisible({ timeout: 10000 });
     
     // Cleanup
-    const testcasesResponse = await request.get('http://localhost:8002/testcases');
+    const testcasesResponse = await request.get('http://localhost:8001/testcases');
     const testcases = await testcasesResponse.json();
     const createdTC = Array.isArray(testcases) ? testcases.find(tc => tc.title === 'E2E New Test Case') : null;
     if (createdTC) {
-      await request.delete(`http://localhost:8002/testcases/${createdTC.id}`);
+      await request.delete(`http://localhost:8001/testcases/${createdTC.id}`);
     }
   });
 
