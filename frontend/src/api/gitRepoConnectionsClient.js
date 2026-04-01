@@ -2,7 +2,7 @@ import axios from "axios";
 
 // jsconfig.json enables checkJs; cast import.meta to any for Vite env access.
 const viteEnv = /** @type {any} */ (import.meta).env;
-const GIT_URL = viteEnv?.VITE_GIT_URL || "http://localhost:8007";
+export const GIT_URL = viteEnv?.VITE_GIT_URL || "http://localhost:8007";
 
 const gitRepoConnectionsAPI = {
   list: async () => {
@@ -35,6 +35,22 @@ const gitRepoConnectionsAPI = {
   update: async (connectionId, data) => {
     const res = await axios.patch(`${GIT_URL}/repo-connections/${connectionId}`, data);
     return res.data;
+  },
+
+  /**
+   * Extract requirements from code in a connected repository using AI.
+   * Returns a ReadableStream (NDJSON) with progress and results.
+   */
+  extractRequirementsStream: (connectionId, { path = null, file_extensions = null, max_files = 60 } = {}) => {
+    const body = { connection_id: connectionId, max_files };
+    if (path) body.path = path;
+    if (file_extensions?.length) body.file_extensions = file_extensions;
+
+    return fetch(`${GIT_URL}/extract-requirements`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
   },
 };
 

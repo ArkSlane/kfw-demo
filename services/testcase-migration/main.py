@@ -19,7 +19,7 @@ def _fwd_headers(request: Request) -> dict:
     """Extract Authorization header for service-to-service forwarding."""
     auth = request.headers.get("authorization", "")
     return {"Authorization": auth} if auth else {}
-from shared.health import aggregate_health_status, check_http_service, check_ollama
+from shared.health import aggregate_health_status, check_http_service, check_azure_llm
 from shared.settings import CORS_ORIGINS, LOG_LEVEL, LOG_FORMAT_JSON
 from shared.logging_config import setup_logging, get_logger
 from shared.auth import setup_auth
@@ -28,12 +28,14 @@ from shared.rate_limit import setup_rate_limiting
 logger = get_logger(__name__)
 
 
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gpt-oss:20b")
+AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "")
+AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY", "")
+AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-12-01-preview")
+AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
 # Deterministic sampling params
-OLLAMA_TEMPERATURE = float(os.getenv("OLLAMA_TEMPERATURE", "0"))
-OLLAMA_TOP_P = float(os.getenv("OLLAMA_TOP_P", "1"))
-OLLAMA_MAX_TOKENS = int(os.getenv("OLLAMA_MAX_TOKENS", "2048"))
+LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0"))
+LLM_TOP_P = float(os.getenv("LLM_TOP_P", "1"))
+LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "8192"))
 
 TESTCASES_URL = os.getenv("TESTCASES_SERVICE_URL", "http://testcases:8000")
 GENERATOR_URL = os.getenv("GENERATOR_SERVICE_URL", "http://generator:8000")
@@ -203,22 +205,23 @@ def _heuristic_analyze(code: str) -> tuple[TestcaseDraft, list[CodeToStepMapping
     return TestcaseDraft(title=title, description=desc, steps=steps), mapping
 
 
-async def _ollama_json(prompt: str) -> dict:
+async def _azure_json(prompt: str) -> dict:
+    url = f"{AZURE_OPENAI_ENDPOINT.rstrip('/')}/openai/deployments/{AZURE_OPENAI_DEPLOYMENT}/chat/completions?api-version={AZURE_OPENAI_API_VERSION}"
     async with httpx.AsyncClient(timeout=60) as client:
         resp = await client.post(
-            f"{OLLAMA_URL}/api/generate",
+            url,
             json={
-                "model": OLLAMA_MODEL,
-                "prompt": prompt,
-                "stream": False,
-                "temperature": float(OLLAMA_TEMPERATURE),
-                "top_p": float(OLLAMA_TOP_P),
-                "max_tokens": int(OLLAMA_MAX_TOKENS),
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": LLM_TEMPERATURE,
+                "top_p": LLM_TOP_P,
+                "max_tokens": LLM_MAX_TOKENS,
+                "response_format": {"type": "json_object"},
             },
+            headers={"api-key": AZURE_OPENAI_API_KEY, "Content-Type": "application/json"},
         )
         resp.raise_for_status()
         data = resp.json()
-        text = (data.get("response") or data.get("output") or "").strip()
+        text = (data.get("choices", [{}])[0].get("message", {}).get("content", "")).strip()
         if not text:
             raise ValueError("empty LLM response")
         text = _strip_markdown_code_fences(text)
@@ -263,7 +266,7 @@ app.add_middleware(
 @app.get("/health")
 async def health():
     deps = {
-        "ollama": await check_ollama(OLLAMA_URL),
+        "azure_llm": await check_azure_llm(AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY),
         "testcases_service": await check_http_service("testcases", TESTCASES_URL),
         "generator_service": await check_http_service("generator", GENERATOR_URL),
         "automations_service": await check_http_service("automations", AUTOMATIONS_URL),
@@ -300,7 +303,7 @@ async def analyze(payload: AnalyzeRequest):
     )
 
     try:
-        parsed = await _ollama_json(prompt)
+        parsed = await _azure_json(prompt)
         testcase = TestcaseDraft.model_validate(parsed.get("testcase") or {})
         mapping = [CodeToStepMapping.model_validate(x) for x in (parsed.get("mapping") or [])]
         if not testcase.steps:
@@ -308,7 +311,7 @@ async def analyze(payload: AnalyzeRequest):
             fallback_tc, fallback_map = _heuristic_analyze(code)
             testcase = fallback_tc
             mapping = fallback_map
-        return AnalyzeResponse(testcase=testcase, mapping=mapping, model=OLLAMA_MODEL, generated_at=now_iso())
+        return AnalyzeResponse(testcase=testcase, mapping=mapping, model=AZURE_OPENAI_DEPLOYMENT, generated_at=now_iso())
     except Exception:
         testcase, mapping = _heuristic_analyze(code)
         return AnalyzeResponse(testcase=testcase, mapping=mapping, model="heuristic", generated_at=now_iso())

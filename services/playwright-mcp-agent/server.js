@@ -1,6 +1,7 @@
 import express from 'express';
 import { promises as fs } from 'fs';
 import path from 'path';
+import crypto from 'crypto';
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
@@ -625,6 +626,108 @@ app.post('/execute-test', async (req, res) => {
     });
   } catch (e) {
     return res.status(200).json({ success: false, error: e?.message || String(e), actions_taken: actionLog.join('\n') });
+  }
+});
+
+// ── Session-based MCP access (for ReAct agent loops) ────────────────────
+const sessions = new Map();
+
+// Clean up stale sessions every 5 minutes (10-min TTL)
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, sess] of sessions) {
+    if (now - sess.created > 10 * 60 * 1000) {
+      sess.transport.close().catch(() => {});
+      sessions.delete(id);
+    }
+  }
+}, 5 * 60 * 1000);
+
+app.post('/session/create', async (req, res) => {
+  try {
+    const id = crypto.randomUUID();
+    const mcpUrl = nextMcpUrl();
+    const client = new Client({ name: 'agent-session', version: '1.0.0' });
+    const transport = new StreamableHTTPClientTransport(new URL(mcpUrl));
+    await client.connect(transport);
+
+    // Set viewport so video recording uses the right resolution
+    try {
+      const prelude = `async (page) => { try { await page.setViewportSize({ width: ${VIDEO_WIDTH}, height: ${VIDEO_HEIGHT} }); } catch(e){} }`;
+      await callTool(client, 'browser_run_code', { code: prelude });
+    } catch { /* best-effort */ }
+
+    sessions.set(id, { client, transport, created: Date.now() });
+    res.json({ success: true, session_id: id });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e?.message || String(e) });
+  }
+});
+
+app.post('/session/:id/tool', async (req, res) => {
+  const sess = sessions.get(req.params.id);
+  if (!sess) return res.status(404).json({ success: false, error: 'Session not found' });
+
+  const { name, args } = req.body || {};
+  try {
+    const result = await callTool(sess.client, name, args || {});
+    const text = textFromToolResult(result);
+    res.json({ success: true, result: text, isError: !!result?.isError });
+  } catch (e) {
+    res.json({ success: false, error: e?.message || String(e), result: '' });
+  }
+});
+
+app.post('/session/:id/close', async (req, res) => {
+  const sess = sessions.get(req.params.id);
+  if (!sess) return res.json({ success: true, video_saved: false });
+
+  const { video_path } = req.body || {};
+  const runStartedAt = sess.created;
+
+  // Finalize: give recorder time, close browser
+  try { await callTool(sess.client, 'browser_wait_for', { time: 3 }); } catch { /* ignore */ }
+  try { await callTool(sess.client, 'browser_close', {}); } catch { /* ignore */ }
+  try { await sess.transport.close(); } catch { /* ignore */ }
+  sessions.delete(req.params.id);
+
+  let videoSaved = false;
+  if (video_path) {
+    try {
+      videoSaved = await maybeRenameNewestVideo({ runStartedAt, video_path });
+    } catch { /* ignore */ }
+  }
+
+  res.json({ success: true, video_saved: videoSaved });
+});
+
+
+// Snapshot endpoint: navigate to a URL, optionally log in, and return accessibility tree
+app.post('/snapshot', async (req, res) => {
+  const { url, login_script } = req.body || {};
+  try {
+    const snapshot = await withMcpClient(async (client) => {
+      // If a login/setup script is provided, run it first
+      if (login_script && typeof login_script === 'string') {
+        const fnCode = `async (page) => {\n  try { await page.setViewportSize({ width: ${VIDEO_WIDTH}, height: ${VIDEO_HEIGHT} }); } catch (e) {}\n${login_script}\n}`;
+        await callTool(client, 'browser_run_code', { code: fnCode });
+      } else if (url) {
+        await callTool(client, 'browser_navigate', { url });
+        await callTool(client, 'browser_wait_for', { time: 2 });
+      }
+
+      const snapResult = await callTool(client, 'browser_snapshot', {});
+      const text = textFromToolResult(snapResult);
+
+      // Close browser to free the MCP core slot
+      try { await callTool(client, 'browser_close', {}); } catch { /* ignore */ }
+
+      return text;
+    });
+
+    return res.json({ success: true, snapshot });
+  } catch (e) {
+    return res.status(200).json({ success: false, error: e?.message || String(e), snapshot: '' });
   }
 });
 

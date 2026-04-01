@@ -2,16 +2,17 @@ import { createApiClient } from './httpClient';
 
 // jsconfig.json enables checkJs; cast import.meta to any for Vite env access.
 const viteEnv = /** @type {any} */ (import.meta).env;
-const AUTOMATIONS_URL = viteEnv?.VITE_AUTOMATIONS_URL || 'http://localhost:8006';
+const AUTOMATIONS_URL = viteEnv?.VITE_AUTOMATIONS_URL || 'http://localhost:8001';
 
 const client = createApiClient(AUTOMATIONS_URL);
 
 const automationsAPI = {
-  list: async (test_case_id = null, status = null, limit = 50, skip = 0) => {
+  list: async (test_case_id = null, status = null, limit = 50, skip = 0, review_status = null) => {
     try {
       const params = { limit, skip };
       if (test_case_id) params.test_case_id = test_case_id;
       if (status) params.status = status;
+      if (review_status) params.review_status = review_status;
       const response = await client.get('/automations', { params });
       return Array.isArray(response.data) ? response.data : response.data.data || [];
     } catch (error) {
@@ -87,6 +88,16 @@ const automationsAPI = {
 
   getRawVideoUrl: (videoFilename) => {
     return `${AUTOMATIONS_URL}/videos/${videoFilename}`;
+  },
+
+  approve: async (automationId, reviewedBy) => {
+    const response = await client.post(`/automations/${automationId}/approve`, null, { params: { reviewed_by: reviewedBy } });
+    return response.data;
+  },
+
+  reject: async (automationId, reviewedBy) => {
+    const response = await client.post(`/automations/${automationId}/reject`, null, { params: { reviewed_by: reviewedBy } });
+    return response.data;
   },
 };
 

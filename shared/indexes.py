@@ -48,6 +48,17 @@ INDEX_DEFINITIONS = {
         ("scope", {}),
         ([("type", 1), ("scope", 1)], {"name": "kg_type_scope_idx"}),
     ],
+    "agent_memory": [
+        ("type", {}),
+        ([("type", 1), ("page", 1)], {"name": "am_type_page_idx"}),
+        ([("type", 1), ("created_at", -1)], {"name": "am_type_date_idx"}),
+        ([("type", 1), ("error_pattern", 1)], {"name": "am_type_error_idx"}),
+    ],
+    "orchestrator_reports": [
+        ("workflow", {}),
+        ("started_at", {}),
+        ([("type", 1), ("workflow", 1), ("started_at", -1)], {"name": "or_workflow_date_idx"}),
+    ],
     "auth_users": [
         ("username", {"unique": True}),
     ],

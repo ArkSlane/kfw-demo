@@ -54,7 +54,7 @@ def setup_repo_with_frontend_files(workspace_dir):
 
 def _make_mock_update(code_factory):
     """Return an async mock for update_code_with_locators that uses code_factory."""
-    async def _mock(code, file_name, *, ollama_url, ollama_model):
+    async def _mock(code, file_name, *, azure_endpoint, azure_api_key, azure_api_version="2024-12-01-preview", azure_deployment="gpt-4o"):
         new_code = code_factory(code, file_name)
         return CodeResponse(code=new_code, message=f"Added locators to {file_name}")
     return _mock

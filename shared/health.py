@@ -1,6 +1,6 @@
 """
 Shared health check utilities for all services.
-Provides dependency health checks for MongoDB, Ollama, and Playwright MCP.
+Provides dependency health checks for MongoDB, Azure OpenAI LLM, and Playwright MCP.
 """
 import httpx
 from datetime import datetime, timezone
@@ -46,79 +46,54 @@ async def check_mongodb(mongo_url: str, db_name: str) -> dict:
             pass
 
 
-async def check_ollama(ollama_url: str, timeout: float = 2.0) -> dict:
+async def check_azure_llm(endpoint: str, api_key: str, timeout: float = 5.0) -> dict:
     """
-    Check Ollama service health.
+    Check Azure OpenAI (AI Foundry) service health.
     
     Returns:
         dict with status, message, and response_time_ms
     """
     start_time = datetime.now(timezone.utc)
-    
+
+    if not endpoint or not api_key:
+        return {
+            "status": "unhealthy",
+            "message": "Azure OpenAI endpoint or API key not configured",
+            "response_time_ms": 0,
+        }
+
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.get(f"{ollama_url}/api/tags")
+            # Call the deployments list endpoint to verify connectivity
+            url = f"{endpoint.rstrip('/')}/openai/models?api-version=2024-12-01-preview"
+            response = await client.get(url, headers={"api-key": api_key})
             response.raise_for_status()
-            
+
             response_time_ms = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
-            
-            models = response.json().get('models', [])
-            model_count = len(models)
 
-            required_model = None
-            try:
-                import os
-                required_model = (os.getenv("OLLAMA_MODEL") or "").strip() or None
-            except Exception:
-                required_model = None
-
-            model_names = [m.get("name") for m in models if isinstance(m, dict)]
-
-            # If Ollama is reachable but not usable for generation, report degraded.
-            if model_count == 0:
-                return {
-                    "status": "degraded",
-                    "message": "Ollama reachable but no models are installed (generation will fail)",
-                    "response_time_ms": round(response_time_ms, 2),
-                    "url": ollama_url,
-                    "models_available": model_count,
-                    "required_model": required_model,
-                }
-
-            if required_model and required_model not in model_names:
-                return {
-                    "status": "degraded",
-                    "message": f"Ollama reachable but required model '{required_model}' is not installed",
-                    "response_time_ms": round(response_time_ms, 2),
-                    "url": ollama_url,
-                    "models_available": model_count,
-                    "required_model": required_model,
-                }
-            
             return {
                 "status": "healthy",
-                "message": f"Ollama service available with {model_count} model(s)",
+                "message": "Azure OpenAI service available",
                 "response_time_ms": round(response_time_ms, 2),
-                "url": ollama_url,
-                "models_available": model_count
+                "endpoint": endpoint,
             }
     except httpx.TimeoutException:
         response_time_ms = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
-        
+
         return {
             "status": "unhealthy",
-            "message": "Ollama service timeout",
+            "message": "Azure OpenAI service timeout",
             "response_time_ms": round(response_time_ms, 2),
-            "url": ollama_url
+            "endpoint": endpoint,
         }
     except Exception as e:
         response_time_ms = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
-        
+
         return {
             "status": "unhealthy",
-            "message": f"Ollama service error: {str(e)}",
+            "message": f"Azure OpenAI service error: {str(e)}",
             "response_time_ms": round(response_time_ms, 2),
-            "url": ollama_url
+            "endpoint": endpoint,
         }
 
 

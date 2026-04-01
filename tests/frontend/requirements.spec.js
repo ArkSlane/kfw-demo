@@ -412,7 +412,7 @@ test.describe('Requirements Page - Filter & Display', () => {
 
   test('should show linked test cases count', async ({ page, request }) => {
     // Create a test case linked to our requirement
-    const testcaseResponse = await request.post('http://localhost:8002/testcases', {
+    const testcaseResponse = await request.post('http://localhost:8001/testcases', {
       data: {
         requirement_id: testIds.requirementId,
         title: 'Linked Test Case',
@@ -448,7 +448,7 @@ test.describe('Requirements Page - Filter & Display', () => {
     }
     
     // Cleanup
-    await request.delete(`http://localhost:8002/testcases/${testcase.id}`);
+    await request.delete(`http://localhost:8001/testcases/${testcase.id}`);
   });
 });
 

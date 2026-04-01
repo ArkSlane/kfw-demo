@@ -44,13 +44,13 @@ export default function ApiInfoDialog({ open, onOpenChange }) {
 import axios from 'axios';
 
 // Call from your test automation framework / CI
-const response = await axios.post('http://localhost:8005/executions', ${JSON.stringify(examplePayload, null, 2)}, {
+const response = await axios.post('http://localhost:8001/executions', ${JSON.stringify(examplePayload, null, 2)}, {
   headers: { 'Content-Type': 'application/json' },
 });
 
 console.log(response.data);`;
 
-  const curlExample = `curl -X POST http://localhost:8005/executions \\
+  const curlExample = `curl -X POST http://localhost:8001/executions \\
   -H "Content-Type: application/json" \\
   -d '${JSON.stringify(examplePayload, null, 2)}'`;
 

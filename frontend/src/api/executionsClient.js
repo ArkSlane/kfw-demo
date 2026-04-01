@@ -1,6 +1,6 @@
 import { createApiClient } from './httpClient';
 
-const API_BASE_URL = 'http://localhost:8005';
+const API_BASE_URL = 'http://localhost:8001';
 
 const client = createApiClient(API_BASE_URL);
 

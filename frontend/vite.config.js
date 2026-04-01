@@ -16,7 +16,7 @@ export default defineConfig({
   },
   server: {
     middlewareMode: false,
-    allowedHosts: ['frontend', 'localhost', '127.0.0.1'],
+    allowedHosts: true,
     hmr: {
       host: 'localhost',
       port: 5173,

@@ -5,10 +5,12 @@ import { testcasesAPI } from "@/api/testcasesClient";
 import { releasesAPI } from "@/api/releasesClient";
 import generatorAPI from "@/api/generatorClient";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { useAuth } from "@/lib/AuthContext";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { Plus, Filter, FileText, AlertCircle, TestTube, Trash2, Hash, Sparkles } from "lucide-react";
+import { Plus, Filter, FileText, AlertCircle, TestTube, Trash2, Hash, Sparkles, CheckCircle, XCircle } from "lucide-react";
+import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import RequirementDialog from "../components/requirements/RequirementDialog";
 import TestCaseDialog from "../components/testcases/TestCaseDialog";
@@ -38,11 +40,19 @@ export default function Requirements() {
   const [advancedAIDialogOpen, setAdvancedAIDialogOpen] = useState(false);
   const [advancedAISuggestions, setAdvancedAISuggestions] = useState(null);
   const [creatingMultipleTests, setCreatingMultipleTests] = useState(false);
+  const [pageTab, setPageTab] = useState("current");
   const queryClient = useQueryClient();
+  const { user } = useAuth();
 
   const { data: requirements, isLoading } = useQuery({
     queryKey: ['requirements'],
     queryFn: () => requirementsAPI.list(),
+    initialData: [],
+  });
+
+  const { data: pendingRequirements, isLoading: isPendingLoading } = useQuery({
+    queryKey: ['requirements', 'pending_review'],
+    queryFn: () => requirementsAPI.list(null, 50, 0, 'pending_review'),
     initialData: [],
   });
 
@@ -97,6 +107,22 @@ export default function Requirements() {
     onError: (error) => {
       toast.error('Failed to delete requirement');
       console.error(error);
+    },
+  });
+
+  const approveMutation = useMutation({
+    mutationFn: (id) => requirementsAPI.approve(id, user?.username || 'unknown'),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['requirements'] });
+      toast.success('Requirement approved!');
+    },
+  });
+
+  const rejectMutation = useMutation({
+    mutationFn: (id) => requirementsAPI.reject(id, user?.username || 'unknown'),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['requirements'] });
+      toast.success('Requirement rejected');
     },
   });
 
@@ -175,6 +201,7 @@ export default function Requirements() {
           title: test.title,
           gherkin: gherkin,
           status: 'draft',
+          review_status: 'pending_review',
           metadata: {
             description: test.description || '',
             priority: (test.priority || 'medium').toLowerCase(),
@@ -260,6 +287,7 @@ export default function Requirements() {
         title: tc.title,
         gherkin,
         status: "draft",
+        review_status: "pending_review",
         metadata: {
           description: tc.description,
           priority,
@@ -375,6 +403,19 @@ export default function Requirements() {
         </Button>
       </div>
 
+      <Tabs value={pageTab} onValueChange={setPageTab}>
+        <TabsList className="bg-slate-100 mb-4">
+          <TabsTrigger value="current">
+            <FileText className="w-4 h-4 mr-2" />
+            Requirements
+          </TabsTrigger>
+          <TabsTrigger value="ai-suggestions">
+            <Sparkles className="w-4 h-4 mr-2" />
+            AI Suggestions
+          </TabsTrigger>
+        </TabsList>
+
+      <TabsContent value="current">
       <Card className="border-none shadow-md">
         <CardHeader className="border-b border-slate-100">
           <div className="flex items-center justify-between flex-wrap gap-4">
@@ -542,6 +583,84 @@ export default function Requirements() {
           )}
         </CardContent>
       </Card>
+      </TabsContent>
+
+      <TabsContent value="ai-suggestions">
+      <Card className="border-none shadow-md">
+        <CardHeader className="border-b border-slate-100">
+          <div className="flex items-center justify-between flex-wrap gap-4">
+            <CardTitle className="text-lg font-semibold">AI-Suggested Requirements</CardTitle>
+            <Badge variant="outline" className="gap-1 text-purple-600 border-purple-300 bg-purple-50">
+              <Sparkles className="w-3 h-3" />
+              {pendingRequirements.length} Pending
+            </Badge>
+          </div>
+        </CardHeader>
+        <CardContent className="p-6">
+          {isPendingLoading ? (
+            <div className="text-center py-12 text-slate-500">Loading...</div>
+          ) : pendingRequirements.length === 0 ? (
+            <div className="text-center py-12">
+              <Sparkles className="w-16 h-16 mx-auto mb-4 text-purple-200" />
+              <p className="text-slate-500 mb-2">No AI suggestions yet</p>
+              <p className="text-sm text-slate-400">AI-generated requirement suggestions will appear here for review and approval.</p>
+            </div>
+          ) : (
+            <div className="grid gap-4">
+              {pendingRequirements.map((req) => (
+                <Card key={req.id} className="border border-purple-200 bg-purple-50/30">
+                  <CardContent className="p-6">
+                    <div className="flex items-start justify-between mb-3">
+                      <div className="flex-1">
+                        <div className="flex items-center gap-2 mb-2">
+                          <Sparkles className="w-4 h-4 text-purple-500" />
+                          <h3 className="text-lg font-semibold text-slate-900">{req.title}</h3>
+                        </div>
+                        <p className="text-slate-600 text-sm line-clamp-3">{req.description}</p>
+                      </div>
+                      <div className="ml-4 flex items-center gap-2">
+                        <Button
+                          size="sm"
+                          className="gap-1 bg-green-600 hover:bg-green-700"
+                          onClick={() => approveMutation.mutate(req.id)}
+                          disabled={approveMutation.isPending}
+                        >
+                          <CheckCircle className="w-3 h-3" />
+                          Approve
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className="gap-1 text-red-600 border-red-300 hover:bg-red-50"
+                          onClick={() => rejectMutation.mutate(req.id)}
+                          disabled={rejectMutation.isPending}
+                        >
+                          <XCircle className="w-3 h-3" />
+                          Reject
+                        </Button>
+                      </div>
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      {req.source && (
+                        <Badge variant="outline" className="text-slate-600 border-slate-300">
+                          {req.source}
+                        </Badge>
+                      )}
+                      {req.tags?.map((tag, idx) => (
+                        <Badge key={idx} variant="outline" className="text-blue-600 border-blue-300 bg-blue-50">
+                          {tag}
+                        </Badge>
+                      ))}
+                    </div>
+                  </CardContent>
+                </Card>
+              ))}
+            </div>
+          )}
+        </CardContent>
+      </Card>
+      </TabsContent>
+      </Tabs>
 
       <RequirementDialog
         open={dialogOpen}

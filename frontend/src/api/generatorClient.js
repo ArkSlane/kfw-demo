@@ -2,7 +2,7 @@ import { createApiClient } from './httpClient';
 
 // jsconfig.json enables checkJs; cast import.meta to any for Vite env access.
 const viteEnv = /** @type {any} */ (import.meta).env;
-const GENERATOR_URL = viteEnv?.VITE_GENERATOR_URL || 'http://localhost:8003';
+const GENERATOR_URL = viteEnv?.VITE_GENERATOR_URL || 'http://localhost:8013';
 
 const client = createApiClient(GENERATOR_URL);
 
@@ -89,6 +89,16 @@ const generatorAPI = {
   
   executeScript: async (payload) => {
     const response = await client.post('/execute-script', payload);
+    return response.data;
+  },
+
+  pushTestToGit: async ({ test_case_id, title, script, repo_connection_id }) => {
+    const response = await client.post('/push-test-to-git', {
+      test_case_id,
+      title,
+      script,
+      repo_connection_id,
+    });
     return response.data;
   },
 };

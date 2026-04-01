@@ -1,7 +1,7 @@
 import React from "react";
 import { Link, useLocation } from "react-router-dom";
 import { createPageUrl } from "@/utils";
-import { ClipboardList, FileText, ClipboardCheck, Bot, Menu, Package, PlayCircle, Sparkles, LogOut, User, Shield, Crosshair, Download, GitMerge } from "lucide-react";
+import { ClipboardList, FileText, ClipboardCheck, Bot, Menu, Package, PlayCircle, Sparkles, LogOut, User, Shield, Crosshair, Download, GitMerge, MonitorSmartphone, ChevronDown } from "lucide-react";
 import {
   Sidebar,
   SidebarContent,
@@ -16,10 +16,12 @@ import {
   SidebarTrigger,
   SidebarFooter,
 } from "@/components/ui/sidebar";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import DemoOverlay from "@/components/DemoOverlay";
 import { useAuth } from "@/lib/AuthContext";
+import { useAppRepo } from "@/lib/AppRepoContext";
 
-const navigationItems = [
+const fachbereichItems = [
   {
     title: "Test Plan",
     url: createPageUrl("TestPlan"),
@@ -51,24 +53,27 @@ const navigationItems = [
     icon: ClipboardCheck,
   },
   {
-    title: "Testcase Migration",
-    url: createPageUrl("testcase-migration"),
-    icon: ClipboardCheck,
+    title: "Executions",
+    url: createPageUrl("Executions"),
+    icon: PlayCircle,
   },
+];
+
+const technicalItems = [
   {
     title: "Automations",
     url: createPageUrl("Automations"),
     icon: Bot,
   },
   {
-    title: "Executions",
-    url: createPageUrl("Executions"),
-    icon: PlayCircle,
-  },
-  {
     title: "Locators",
     url: createPageUrl("Locators"),
     icon: Crosshair,
+  },
+  {
+    title: "Testcase Migration",
+    url: createPageUrl("testcase-migration"),
+    icon: ClipboardCheck,
   },
   {
     title: "Extract Requirements",
@@ -85,6 +90,7 @@ const navigationItems = [
 export default function Layout({ children }) {
   const location = useLocation();
   const { user, logout, authEnabled } = useAuth();
+  const { appRepos, selectedAppRepoId, selectedAppRepo, setSelectedAppRepoId } = useAppRepo();
 
   const userRole = user?.role || 'viewer';
   const isAdmin = userRole === 'admin';
@@ -113,13 +119,69 @@ export default function Layout({ children }) {
           </SidebarHeader>
           
           <SidebarContent className="p-3">
+            {/* Application selector */}
+            {appRepos.length > 0 && (
+              <SidebarGroup>
+                <SidebarGroupLabel className="text-xs font-semibold text-slate-500 uppercase tracking-wider px-3 py-2">
+                  Application
+                </SidebarGroupLabel>
+                <SidebarGroupContent className="px-2">
+                  <Select value={selectedAppRepoId || ""} onValueChange={(v) => setSelectedAppRepoId(v || null)}>
+                    <SelectTrigger className="w-full h-9 text-sm bg-white border-slate-200">
+                      <div className="flex items-center gap-2 truncate">
+                        <MonitorSmartphone className="w-4 h-4 shrink-0 text-slate-400" />
+                        <SelectValue placeholder="Select application" />
+                      </div>
+                    </SelectTrigger>
+                    <SelectContent>
+                      {appRepos.map((repo) => {
+                        const name = repo.repo_url
+                          ? repo.repo_url.split('/').pop().replace('.git', '')
+                          : repo.repo_path;
+                        return (
+                          <SelectItem key={repo.id} value={repo.id}>
+                            {name}
+                          </SelectItem>
+                        );
+                      })}
+                    </SelectContent>
+                  </Select>
+                </SidebarGroupContent>
+              </SidebarGroup>
+            )}
+
             <SidebarGroup>
               <SidebarGroupLabel className="text-xs font-semibold text-slate-500 uppercase tracking-wider px-3 py-2">
-                Navigation
+                Fachbereich
               </SidebarGroupLabel>
               <SidebarGroupContent>
                 <SidebarMenu>
-                  {navigationItems.map((item) => (
+                  {fachbereichItems.map((item) => (
+                    <SidebarMenuItem key={item.title}>
+                      <SidebarMenuButton 
+                        asChild 
+                        className={`hover:bg-blue-50 hover:text-blue-700 transition-all duration-200 rounded-lg mb-1 ${
+                          location.pathname === item.url ? 'bg-blue-50 text-blue-700 font-medium' : ''
+                        }`}
+                      >
+                        <Link to={item.url} className="flex items-center gap-3 px-3 py-2.5">
+                          <item.icon className="w-5 h-5" />
+                          <span>{item.title}</span>
+                        </Link>
+                      </SidebarMenuButton>
+                    </SidebarMenuItem>
+                  ))}
+                </SidebarMenu>
+              </SidebarGroupContent>
+            </SidebarGroup>
+
+            <SidebarGroup>
+              <SidebarGroupLabel className="text-xs font-semibold text-slate-500 uppercase tracking-wider px-3 py-2">
+                Technisch
+              </SidebarGroupLabel>
+              <SidebarGroupContent>
+                <SidebarMenu>
+                  {technicalItems.map((item) => (
                     <SidebarMenuItem key={item.title}>
                       <SidebarMenuButton 
                         asChild 

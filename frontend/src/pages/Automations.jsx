@@ -2,11 +2,12 @@ import React, { useState } from "react";
 import { Link } from "react-router-dom";
 import { createPageUrl } from "@/utils";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { useAuth } from "@/lib/AuthContext";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { Plus, Bot, CheckCircle2, XCircle, Filter, Trash2, Play, Video, List } from "lucide-react";
-import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Plus, Bot, CheckCircle2, XCircle, Filter, Trash2, Play, Video, List, Sparkles } from "lucide-react";
+import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import AutomationDialog from "../components/automations/AutomationDialog";
 import { format } from "date-fns";
@@ -36,11 +37,18 @@ export default function Automations() {
   const [actionsDialogOpen, setActionsDialogOpen] = useState(false);
   const [selectedActions, setSelectedActions] = useState("");
   const [newlyCreatedId, setNewlyCreatedId] = useState(null);
+  const [pageTab, setPageTab] = useState("current");
   const queryClient = useQueryClient();
+  const { user } = useAuth();
 
   const { data: automations = [], isLoading } = useQuery({
     queryKey: ['automations'],
     queryFn: () => automationsAPI.list(),
+  });
+
+  const { data: pendingAutomations = [], isLoading: isPendingLoading } = useQuery({
+    queryKey: ['automations', 'pending_review'],
+    queryFn: () => automationsAPI.list(null, null, 50, 0, 'pending_review'),
   });
 
   const { data: testCases = [] } = useQuery({
@@ -87,6 +95,22 @@ export default function Automations() {
     },
     onError: () => {
       toast.error('Failed to delete automation');
+    },
+  });
+
+  const approveAutomationMutation = useMutation({
+    mutationFn: (id) => automationsAPI.approve(id, user?.username || 'unknown'),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['automations'] });
+      toast.success('Automation approved!');
+    },
+  });
+
+  const rejectAutomationMutation = useMutation({
+    mutationFn: (id) => automationsAPI.reject(id, user?.username || 'unknown'),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['automations'] });
+      toast.success('Automation rejected');
     },
   });
 
@@ -186,6 +210,19 @@ export default function Automations() {
         </Button>
       </div>
 
+      <Tabs value={pageTab} onValueChange={setPageTab}>
+        <TabsList className="bg-slate-100 mb-4">
+          <TabsTrigger value="current">
+            <Bot className="w-4 h-4 mr-2" />
+            Automations
+          </TabsTrigger>
+          <TabsTrigger value="ai-suggestions">
+            <Sparkles className="w-4 h-4 mr-2" />
+            AI Suggestions
+          </TabsTrigger>
+        </TabsList>
+
+      <TabsContent value="current">
       <Card className="border-none shadow-md">
         <CardHeader className="border-b border-slate-100">
           <div className="flex items-center justify-between flex-wrap gap-4">
@@ -339,6 +376,85 @@ export default function Automations() {
           )}
         </CardContent>
       </Card>
+      </TabsContent>
+
+      <TabsContent value="ai-suggestions">
+      <Card className="border-none shadow-md">
+        <CardHeader className="border-b border-slate-100">
+          <div className="flex items-center justify-between flex-wrap gap-4">
+            <CardTitle className="text-lg font-semibold">AI-Suggested Automations</CardTitle>
+            <Badge variant="outline" className="gap-1 text-purple-600 border-purple-300 bg-purple-50">
+              <Sparkles className="w-3 h-3" />
+              {pendingAutomations.length} Pending
+            </Badge>
+          </div>
+        </CardHeader>
+        <CardContent className="p-6">
+          {isPendingLoading ? (
+            <div className="text-center py-12 text-slate-500">Loading...</div>
+          ) : pendingAutomations.length === 0 ? (
+            <div className="text-center py-12">
+              <Sparkles className="w-16 h-16 mx-auto mb-4 text-purple-200" />
+              <p className="text-slate-500 mb-2">No AI suggestions yet</p>
+              <p className="text-sm text-slate-400">AI-generated automation suggestions will appear here for review and approval.</p>
+            </div>
+          ) : (
+            <div className="grid gap-4">
+              {pendingAutomations.map((auto) => {
+                const linkedTestCase = testCases.find(tc => tc.id === auto.test_case_id);
+                return (
+                  <Card key={auto.id} className="border border-purple-200 bg-purple-50/30">
+                    <CardContent className="p-6">
+                      <div className="flex items-start justify-between mb-3">
+                        <div className="flex-1">
+                          <div className="flex items-center gap-2 mb-2">
+                            <Sparkles className="w-4 h-4 text-purple-500" />
+                            <h3 className="text-lg font-semibold text-slate-900">{auto.title}</h3>
+                          </div>
+                          <p className="text-slate-600 text-sm">Framework: {auto.framework}</p>
+                        </div>
+                        <div className="ml-4 flex items-center gap-2">
+                          <Button
+                            size="sm"
+                            className="gap-1 bg-green-600 hover:bg-green-700"
+                            onClick={() => approveAutomationMutation.mutate(auto.id)}
+                            disabled={approveAutomationMutation.isPending}
+                          >
+                            <CheckCircle2 className="w-3 h-3" />
+                            Approve
+                          </Button>
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            className="gap-1 text-red-600 border-red-300 hover:bg-red-50"
+                            onClick={() => rejectAutomationMutation.mutate(auto.id)}
+                            disabled={rejectAutomationMutation.isPending}
+                          >
+                            <XCircle className="w-3 h-3" />
+                            Reject
+                          </Button>
+                        </div>
+                      </div>
+                      <div className="flex flex-wrap gap-2">
+                        {linkedTestCase && (
+                          <Badge variant="outline" className="text-slate-600 border-slate-300">
+                            TC: {linkedTestCase.title}
+                          </Badge>
+                        )}
+                        <Badge variant="outline" className="text-slate-600 border-slate-300">
+                          {auto.status}
+                        </Badge>
+                      </div>
+                    </CardContent>
+                  </Card>
+                );
+              })}
+            </div>
+          )}
+        </CardContent>
+      </Card>
+      </TabsContent>
+      </Tabs>
 
       <AutomationDialog
         open={dialogOpen}
